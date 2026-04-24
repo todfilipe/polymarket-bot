@@ -79,11 +79,19 @@ async def _score_one(
             trades = await client.get_wallet_trades_for_scoring(
                 entry.wallet_address, window_weeks=window_weeks
             )
+            positions = await client.get_realized_positions(
+                entry.wallet_address, window_weeks=window_weeks
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "discovery: falha a buscar trades de {}: {}",
+                "discovery: falha a buscar dados de {}: {}",
                 entry.wallet_address,
                 exc,
             )
             return None
-    return score_wallet(entry.wallet_address, trades, window_weeks=window_weeks)
+    return score_wallet(
+        entry.wallet_address,
+        trades,
+        window_weeks=window_weeks,
+        positions=positions,
+    )

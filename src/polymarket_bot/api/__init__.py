@@ -9,6 +9,7 @@ from polymarket_bot.api.polymarket_clob import (
 from polymarket_bot.api.polymarket_data import (
     PolymarketDataClient,
     PolymarketDataError,
+    RawPosition,
     RawTrade,
     WalletProfitSummary,
 )
@@ -17,6 +18,7 @@ __all__ = [
     "CredentialsSetupResult",
     "PolymarketDataClient",
     "PolymarketDataError",
+    "RawPosition",
     "RawTrade",
     "SignatureType",
     "WalletProfitSummary",

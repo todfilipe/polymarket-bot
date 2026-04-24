@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Iterable
 
-from polymarket_bot.api.polymarket_data import RawTrade
+from polymarket_bot.api.polymarket_data import RawPosition, RawTrade
 from polymarket_bot.config.constants import CONST
 from polymarket_bot.wallets.filters import EligibilityResult, check_eligibility
 from polymarket_bot.wallets.metrics import WalletMetrics, compute_metrics
@@ -49,9 +49,16 @@ def score_wallet(
     wallet_address: str,
     trades: Iterable[RawTrade],
     window_weeks: int = CONST.SCORING_WINDOW_WEEKS,
+    positions: Iterable[RawPosition] | None = None,
 ) -> ScoredWallet:
-    """Ponto de entrada — computa métricas, aplica filtros e devolve score 0–100."""
-    metrics = compute_metrics(wallet_address, trades, window_weeks=window_weeks)
+    """Ponto de entrada — computa métricas, aplica filtros e devolve score 0–100.
+
+    ``positions`` é opcional: quando fornecido (produção), é a fonte de P&L;
+    quando ``None`` (testes), o fallback usa ``RawTrade.realized_pnl_usd``.
+    """
+    metrics = compute_metrics(
+        wallet_address, trades, window_weeks=window_weeks, positions=positions
+    )
     eligibility = check_eligibility(metrics)
 
     pf_norm = _norm_profit_factor(metrics.profit_factor)
