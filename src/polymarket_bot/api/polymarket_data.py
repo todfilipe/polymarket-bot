@@ -4,7 +4,9 @@ Endpoints usados:
 - `/trades?user=<address>&limit=<n>` — histórico de trades por wallet
 - `/positions?user=<address>` — posições actuais
 - `/activity?user=<address>` — feed de atividade (inclui P&L realizado)
-- `/profit?user=<address>&interval=<period>` — profit agregado (usado para discovery)
+- `/v1/leaderboard?category=OVERALL&timePeriod=<WEEK|MONTH|ALL>&orderBy=PNL`
+  — ranking de wallets por PnL (usado para discovery; paginação com offset,
+  limit máx 50)
 
 NOTA: os endpoints exatos e nomes de parâmetros devem ser verificados contra a
 documentação ao vivo antes de deploy. O cliente abstrai a resposta em dataclasses
@@ -128,30 +130,48 @@ class PolymarketDataClient:
         return await self.get_wallet_trades(wallet_address, since=cutoff, limit=1000)
 
     # -------------------------------------------------- discovery (top wallets)
+    _LEADERBOARD_PATH = "/v1/leaderboard"
+    _LEADERBOARD_PAGE_SIZE = 50  # máximo aceite pela Data API
+    _LEADERBOARD_MAX_OFFSET = 1000
+
     async def get_top_wallets_by_profit(
         self, window_weeks: int = 4, top_n: int = 150
     ) -> list[WalletProfitSummary]:
         """Leaderboard de wallets por profit nas últimas N semanas.
 
         Usado no scoring de domingo para construir o universo candidato.
+        Endpoint: GET /v1/leaderboard — `limit` máx 50, paginação via `offset`.
         """
-        params = {
-            "interval": self._window_to_interval(window_weeks),
-            "limit": top_n,
-            "sortBy": "profit",
-            "order": "desc",
-        }
-        raw = await self._get("/profit/leaderboard", params=params)
-        return [self._parse_profit_summary(entry) for entry in raw or []]
+        time_period = self._window_to_time_period(window_weeks)
+        results: list[WalletProfitSummary] = []
+        offset = 0
+        while len(results) < top_n and offset <= self._LEADERBOARD_MAX_OFFSET:
+            page_size = min(self._LEADERBOARD_PAGE_SIZE, top_n - len(results))
+            params = {
+                "category": "OVERALL",
+                "timePeriod": time_period,
+                "orderBy": "PNL",
+                "limit": page_size,
+                "offset": offset,
+            }
+            raw = await self._get(self._LEADERBOARD_PATH, params=params)
+            page = [self._parse_profit_summary(entry) for entry in raw or []]
+            if not page:
+                break
+            results.extend(page)
+            if len(page) < page_size:
+                break
+            offset += page_size
+        return results[:top_n]
 
     # ------------------------------------------------------------ helpers
     @staticmethod
-    def _window_to_interval(weeks: int) -> str:
+    def _window_to_time_period(weeks: int) -> str:
         if weeks <= 1:
-            return "1w"
+            return "WEEK"
         if weeks <= 4:
-            return "1m"
-        return "all"
+            return "MONTH"
+        return "ALL"
 
     @staticmethod
     def _parse_trade(wallet_address: str, entry: dict[str, Any]) -> RawTrade | None:
@@ -188,9 +208,17 @@ class PolymarketDataClient:
 
     @staticmethod
     def _parse_profit_summary(entry: dict[str, Any]) -> WalletProfitSummary:
+        wallet = (
+            entry.get("proxyWallet")
+            or entry.get("user")
+            or entry.get("address")
+            or ""
+        )
+        profit = entry.get("pnl", entry.get("profit", "0"))
+        volume = entry.get("vol", entry.get("volume", "0"))
         return WalletProfitSummary(
-            wallet_address=str(entry.get("user") or entry.get("address") or "").lower(),
-            profit_usd=Decimal(str(entry.get("profit", "0"))),
+            wallet_address=str(wallet).lower(),
+            profit_usd=Decimal(str(profit)),
             trades_count=int(entry.get("trades", 0)),
-            volume_usd=Decimal(str(entry.get("volume", "0"))),
+            volume_usd=Decimal(str(volume)),
         )
