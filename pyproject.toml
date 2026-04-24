@@ -1,0 +1,77 @@
+[project]
+name = "polymarket-bot"
+version = "0.1.0"
+description = "Polymarket Copytrade Bot — replica top traders com controlo de risco"
+requires-python = ">=3.11"
+readme = "README.md"
+
+dependencies = [
+    # Polymarket / Web3
+    "py-clob-client>=0.17",
+    "web3>=7.0",
+    "eth-account>=0.13",
+
+    # HTTP / WebSocket async
+    "aiohttp>=3.9",
+    "websockets>=13.0",
+    "tenacity>=9.0",
+
+    # Telegram
+    "python-telegram-bot>=21.0",
+
+    # Persistência
+    "sqlalchemy[asyncio]>=2.0",
+    "aiosqlite>=0.20",
+    "alembic>=1.13",
+
+    # Scheduling
+    "apscheduler>=3.10",
+
+    # Dados / numérico
+    "pandas>=2.2",
+    "numpy>=2.0",
+
+    # Config / logging
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "python-dotenv>=1.0",
+    "loguru>=0.7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=5.0",
+    "ruff>=0.7",
+    "mypy>=1.13",
+    "types-pytz",
+]
+
+[project.scripts]
+polymarket-bot = "polymarket_bot.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/polymarket_bot"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true

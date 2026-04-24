@@ -1,0 +1,38 @@
+# Secrets
+.env
+*.pem
+*.key
+
+# Dados e DB
+data/
+*.db
+*.db-journal
+*.sqlite*
+
+# Logs
+logs/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
