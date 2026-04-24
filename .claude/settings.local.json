@@ -43,7 +43,12 @@
       "Bash(python -m pytest tests/ -q)",
       "Bash(python -c \"import polymarket_bot.main; import polymarket_bot.execution.order_manager; import polymarket_bot.monitoring.exit_manager; import polymarket_bot.monitoring.signal_reader; print\\('ok'\\)\")",
       "Bash(PYTHONPATH=src python -c \"import polymarket_bot.main; import polymarket_bot.execution.order_manager; import polymarket_bot.monitoring.exit_manager; import polymarket_bot.monitoring.signal_reader; print\\('ok'\\)\")",
-      "Bash(python -m pytest tests/unit/test_exposure_guard.py -v)"
+      "Bash(python -m pytest tests/unit/test_exposure_guard.py -v)",
+      "WebSearch",
+      "WebFetch(domain:docs.polymarket.com)",
+      "WebFetch(domain:data-api.polymarket.com)",
+      "Bash(curl -s \"https://data-api.polymarket.com/v1/leaderboard?category=OVERALL&timePeriod=MONTH&orderBy=PNL&limit=2&offset=0\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('src/polymarket_bot/api/polymarket_data.py'\\).read\\(\\)\\); print\\('syntax ok'\\)\")"
     ]
   }
 }
