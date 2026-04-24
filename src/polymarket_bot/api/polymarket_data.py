@@ -172,7 +172,7 @@ class PolymarketDataClient:
 
     # ------------------------------------------------------------- activity
     _ACTIVITY_PAGE_SIZE = 500
-    _ACTIVITY_MAX_PAGES = 20  # 20 × 500 = 10k eventos — chega para 4 semanas
+    _ACTIVITY_MAX_PAGES = 6   # 6 × 500 = 3000 — limite real da API (400 acima)
 
     async def get_wallet_activity(
         self,
@@ -182,8 +182,10 @@ class PolymarketDataClient:
     ) -> list[dict[str, Any]]:
         """Devolve eventos brutos de `/activity` (TRADE, REDEEM, …) paginados.
 
-        Filtra por ``since`` localmente; pára quando o página devolve eventos
+        Filtra por ``since`` localmente; pára quando a página devolve eventos
         mais antigos que o cutoff (a API ordena desc por timestamp).
+        A API rejeita offsets > 3000 com 400 — tratamos isso como fim de
+        paginação em vez de erro fatal.
         """
         cap = max_events or self._ACTIVITY_PAGE_SIZE * self._ACTIVITY_MAX_PAGES
         cutoff_ts = int(since.timestamp()) if since else None
@@ -195,7 +197,13 @@ class PolymarketDataClient:
                 "limit": self._ACTIVITY_PAGE_SIZE,
                 "offset": offset,
             }
-            raw = await self._get("/activity", params=params)
+            try:
+                raw = await self._get("/activity", params=params)
+            except aiohttp.ClientResponseError as exc:
+                if exc.status == 400:
+                    # API não suporta este offset — parar paginação silenciosamente
+                    break
+                raise
             if not raw:
                 break
             events.extend(raw)
