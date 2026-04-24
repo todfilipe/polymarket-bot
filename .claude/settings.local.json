@@ -48,7 +48,26 @@
       "WebFetch(domain:docs.polymarket.com)",
       "WebFetch(domain:data-api.polymarket.com)",
       "Bash(curl -s \"https://data-api.polymarket.com/v1/leaderboard?category=OVERALL&timePeriod=MONTH&orderBy=PNL&limit=2&offset=0\")",
-      "Bash(python -c \"import ast; ast.parse\\(open\\('src/polymarket_bot/api/polymarket_data.py'\\).read\\(\\)\\); print\\('syntax ok'\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\('src/polymarket_bot/api/polymarket_data.py'\\).read\\(\\)\\); print\\('syntax ok'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('scripts/force_rebalance.py'\\).read\\(\\)\\); print\\('syntax ok'\\)\")",
+      "Bash(python scripts/force_rebalance.py --help)",
+      "Bash(python -c \"import py_compile; py_compile.compile\\('scripts/force_rebalance.py', doraise=True\\); print\\('compile ok'\\)\")",
+      "Bash(PYTHONIOENCODING=utf-8 python scripts/force_rebalance.py --help)",
+      "Bash(PYTHONIOENCODING=utf-8 python scripts/force_rebalance.py --verbose)",
+      "Bash(curl -s \"https://data-api.polymarket.com/trades?user=0x492442eab586f242b53bda933fd5de859c8a3782&limit=3\")",
+      "Bash(python -m json.tool)",
+      "Bash(curl -s \"https://data-api.polymarket.com/activity?user=0x492442eab586f242b53bda933fd5de859c8a3782&limit=3\")",
+      "Bash(curl -s \"https://data-api.polymarket.com/positions?user=0x492442eab586f242b53bda933fd5de859c8a3782&limit=3\")",
+      "Bash(curl -s \"https://data-api.polymarket.com/value?user=0x492442eab586f242b53bda933fd5de859c8a3782\")",
+      "Bash(curl -s \"https://data-api.polymarket.com/profit?user=0x492442eab586f242b53bda933fd5de859c8a3782\")",
+      "Bash(curl -s \"https://gamma-api.polymarket.com/markets?condition_ids=0xc31c794c248a759fd07934b6ff65bba5ee775e511d6887c44ef72de1a0638bb3\")",
+      "Bash(python -c \"import py_compile; [py_compile.compile\\(p, doraise=True\\) for p in ['src/polymarket_bot/api/polymarket_data.py', 'src/polymarket_bot/api/__init__.py', 'src/polymarket_bot/wallets/metrics.py', 'src/polymarket_bot/wallets/scoring.py', 'src/polymarket_bot/wallets/discovery.py', 'scripts/force_rebalance.py']]; print\\('compile ok'\\)\")",
+      "Bash(PYTHONIOENCODING=utf-8 python -m pytest tests/unit/test_scoring.py -q)",
+      "Bash(curl -s \"https://data-api.polymarket.com/activity?user=0x492442eab586f242b53bda933fd5de859c8a3782&limit=500&offset=0\")",
+      "Bash(python -c \"import sys, json; d=json.load\\(sys.stdin\\); print\\(f'count: {len\\(d\\)}'\\); types=[e.get\\('type'\\) for e in d]; from collections import Counter; print\\('type counts:', Counter\\(types\\)\\); print\\('oldest ts:', min\\(e['timestamp'] for e in d\\)\\); print\\('newest ts:', max\\(e['timestamp'] for e in d\\)\\)\")",
+      "Bash(curl -s \"https://data-api.polymarket.com/activity?user=0x492442eab586f242b53bda933fd5de859c8a3782&limit=3&offset=500\")",
+      "Bash(python -c \"import py_compile; [py_compile.compile\\(p, doraise=True\\) for p in ['src/polymarket_bot/api/polymarket_data.py', 'src/polymarket_bot/wallets/metrics.py', 'src/polymarket_bot/wallets/discovery.py', 'scripts/force_rebalance.py']]; print\\('compile ok'\\)\")",
+      "Bash(python -c \"import py_compile; [py_compile.compile\\(p, doraise=True\\) for p in ['src/polymarket_bot/api/polymarket_data.py', 'src/polymarket_bot/wallets/discovery.py', 'scripts/force_rebalance.py']]; print\\('compile ok'\\)\")"
     ]
   }
 }
