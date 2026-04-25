@@ -169,6 +169,7 @@ class ChainWatcher:
         self._poll_interval = poll_interval_seconds
 
         self._followed_map: dict[str, FollowedWallet] = {}
+        self._followed_addresses: set[str] = set()
         self.update_followed_wallets(followed_wallets)
 
         self._stop = asyncio.Event()
@@ -180,12 +181,17 @@ class ChainWatcher:
     def update_followed_wallets(
         self, wallets: Iterable[FollowedWallet]
     ) -> None:
-        """Substitui o universo seguido. Chamado após rebalanceamento."""
+        """Substitui o universo seguido. Chamado após rebalanceamento.
+
+        Endereços normalizados para lowercase em ambos os lados (mapa + set) —
+        comparações com `parsed.maker`/`taker` são sempre case-insensitive.
+        """
         self._followed_map = {w.address.lower(): w for w in wallets}
+        self._followed_addresses = set(self._followed_map.keys())
 
     @property
     def followed_addresses(self) -> set[str]:
-        return set(self._followed_map.keys())
+        return set(self._followed_addresses)
 
     def stop(self) -> None:
         self._stop.set()
@@ -301,9 +307,16 @@ class ChainWatcher:
 
         backoff = _WS_RECONNECT_INITIAL_DELAY
         consecutive_failures = 0
+        connection_attempt = 0
 
         while not self._stop.is_set():
             sub_id: str | None = None
+            connection_attempt += 1
+            logger.info(
+                "chain_watcher: WS a {} (tentativa #{})",
+                "reconectar" if connection_attempt > 1 else "conectar",
+                connection_attempt,
+            )
             try:
                 async with websockets.connect(
                     self._ws_url,  # type: ignore[arg-type]
@@ -311,12 +324,20 @@ class ChainWatcher:
                     ping_timeout=20,
                     close_timeout=5,
                 ) as ws:
+                    prior_failures = consecutive_failures
                     consecutive_failures = 0
                     backoff = _WS_RECONNECT_INITIAL_DELAY
                     sub_id = await self._ws_subscribe(ws)
-                    logger.info(
-                        "chain_watcher: WS subscrito (sub_id={})", sub_id
-                    )
+                    if prior_failures > 0:
+                        logger.info(
+                            "chain_watcher: WS RECONECTADO após {} falha(s) "
+                            "(sub_id={})",
+                            prior_failures, sub_id,
+                        )
+                    else:
+                        logger.info(
+                            "chain_watcher: WS subscrito (sub_id={})", sub_id
+                        )
 
                     # Apanha eventos publicados antes da subscrição entrar live.
                     try:
@@ -408,10 +429,20 @@ class ChainWatcher:
             return
 
         followed_addr, side, token_id = self._resolve_followed(parsed)
-        if followed_addr is None:
+        matched = followed_addr is not None
+        logger.debug(
+            "chain_watcher: OrderFilled recebido | maker={} taker={} match={}",
+            parsed.maker.lower(), parsed.taker.lower(), matched,
+        )
+        if not matched:
             # Trade entre wallets não-seguidas — ignorar sem marcar como seen
             # (não faz sentido encher o set com lixo).
             return
+
+        logger.info(
+            "chain_watcher: sinal detetado | wallet={} maker={} tx={}",
+            followed_addr, parsed.maker.lower(), parsed.tx_hash,
+        )
 
         # Marca como visto antes da resolução; mesmo que o resolver falhe, evita
         # retentar o mesmo log indefinidamente.
@@ -457,8 +488,15 @@ class ChainWatcher:
         self, parsed: _ParsedLog
     ) -> tuple[str | None, TradeSide, str]:
         """Devolve `(followed_addr, side, token_id)` ou `(None, _, _)` se nenhum
-        endereço seguido aparece no log."""
-        if parsed.maker in self._followed_map:
+        endereço seguido aparece no log.
+
+        Comparação case-insensitive: `_followed_addresses` está em lowercase e
+        forçamos `.lower()` no maker/taker do log. Defensivo — `_decode_address_topic`
+        já lowercase, mas evita regressões se um path futuro injectar checksummed.
+        """
+        maker = parsed.maker.lower()
+        taker = parsed.taker.lower()
+        if maker in self._followed_addresses:
             side = (
                 TradeSide.BUY
                 if parsed.maker_asset_id == 0
@@ -469,8 +507,8 @@ class ChainWatcher:
                 if parsed.maker_asset_id == 0
                 else str(parsed.maker_asset_id)
             )
-            return parsed.maker, side, token_id
-        if parsed.taker in self._followed_map:
+            return maker, side, token_id
+        if taker in self._followed_addresses:
             side = (
                 TradeSide.BUY
                 if parsed.taker_asset_id == 0
@@ -481,7 +519,7 @@ class ChainWatcher:
                 if parsed.taker_asset_id == 0
                 else str(parsed.taker_asset_id)
             )
-            return parsed.taker, side, token_id
+            return taker, side, token_id
         return None, TradeSide.BUY, ""
 
     @staticmethod
