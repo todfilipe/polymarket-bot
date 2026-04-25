@@ -23,6 +23,12 @@ class Settings(BaseSettings):
     polygon_private_key: SecretStr
     polygon_chain_id: int = 137
     polygon_rpc_url: str = "https://polygon-rpc.com"
+    polygon_ws_url: str | None = None
+
+    # Fonte de sinais de trade. "chain" lê eventos OrderFilled directamente
+    # do CTF Exchange via Polygon RPC (lag <2s). "api" usa o polling à
+    # Polymarket Data API (lag 1h+). "both" corre os dois com dedup partilhado.
+    signal_source: Literal["api", "chain", "both"] = "chain"
 
     clob_api_url: str = "https://clob.polymarket.com"
     polymarket_data_api_url: str = "https://data-api.polymarket.com"

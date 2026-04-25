@@ -29,6 +29,10 @@ from polymarket_bot.config import Settings, get_settings
 from polymarket_bot.db.models import Base
 from polymarket_bot.execution.order_manager import OrderManager
 from polymarket_bot.execution.pipeline import ExecutionPipeline
+from polymarket_bot.monitoring.chain_watcher import (
+    ChainWatcher,
+    MarketIdResolver,
+)
 from polymarket_bot.monitoring.exit_manager import ExitManager
 from polymarket_bot.monitoring.market_builder import MarketBuilder
 from polymarket_bot.monitoring.signal_reader import SignalReader
@@ -150,7 +154,28 @@ async def main() -> None:
     )
     # Reader partilhado entre o WalletMonitor (poll_once para BUYs) e o
     # ExitManager (poll_sells para wallet exits). O cursor + dedup é único.
-    signal_reader = SignalReader(wallets=[], data_client=data_client)
+    signal_reader = SignalReader(
+        wallets=[], data_client=data_client, source=settings.signal_source
+    )
+    # ChainWatcher: deteção on-chain via Polygon RPC (CLAUDE.md §13). Substitui
+    # o polling à Data API quando `signal_source` é "chain" ou "both".
+    chain_watcher: ChainWatcher | None = None
+    if settings.signal_source in ("chain", "both"):
+        market_resolver = MarketIdResolver(
+            clob_url=settings.clob_api_url, http_session=http_session
+        )
+
+        async def _on_chain_signal(sig):  # noqa: ANN001 — local closure
+            signal_reader.inject_signal(sig)
+
+        chain_watcher = ChainWatcher(
+            rpc_url=settings.polygon_rpc_url,
+            ws_url=settings.polygon_ws_url,
+            followed_wallets=[],
+            signal_callback=_on_chain_signal,
+            market_resolver=market_resolver.resolve,
+            http_session=http_session,
+        )
     exit_manager = ExitManager(
         session_factory=sessionmaker,
         clob_client_factory=lambda: clob_client,
@@ -160,16 +185,21 @@ async def main() -> None:
         live_mode=settings.live_mode,
         signal_reader=signal_reader,
     )
+    # Em modo "chain", o lag não vem do poll interval — vem do RPC. Encurtamos
+    # o tick para 5s para drenar o buffer rapidamente sem martelar a Data API.
+    monitor_poll_interval = 5 if settings.signal_source == "chain" else 30
     monitor = WalletMonitor(
         pipeline=pipeline,
         data_client=data_client,
         db_session_factory=sessionmaker,
+        poll_interval_seconds=monitor_poll_interval,
         market_builder=market_builder,
         signal_reader=signal_reader,
         bankroll_provider=lambda _sm: portfolio.get_bankroll(),
         exit_manager=exit_manager,
         notifier=notifier,
         live_mode=settings.live_mode,
+        chain_watcher=chain_watcher,
     )
     scheduler = RebalancingScheduler(
         monitor=monitor,

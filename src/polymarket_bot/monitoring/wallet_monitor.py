@@ -46,6 +46,7 @@ from polymarket_bot.execution.pipeline import (
     SignalInput,
 )
 from polymarket_bot.market import WalletSignal
+from polymarket_bot.monitoring.chain_watcher import ChainWatcher
 from polymarket_bot.monitoring.exit_manager import ExitManager
 from polymarket_bot.monitoring.market_builder import MarketBuilder, MarketBuildError
 from polymarket_bot.monitoring.signal_reader import (
@@ -86,6 +87,7 @@ class WalletMonitor:
         exit_manager: ExitManager | None = None,
         notifier: TelegramNotifier | None = None,
         live_mode: bool = False,
+        chain_watcher: ChainWatcher | None = None,
     ):
         self._pipeline = pipeline
         self._data_client = data_client
@@ -99,6 +101,8 @@ class WalletMonitor:
         self._exit_manager = exit_manager
         self._notifier = notifier
         self._live_mode = live_mode
+        self._chain_watcher = chain_watcher
+        self._chain_task: asyncio.Task[None] | None = None
         self._stop_event = asyncio.Event()
 
     # ------------------------------------------------------------------ public
@@ -107,40 +111,64 @@ class WalletMonitor:
         if not self._reader.followed_addresses:
             await self.reload_followed_wallets()
 
+        if self._chain_watcher is not None:
+            self._chain_task = asyncio.create_task(
+                self._chain_watcher.run_forever(), name="chain_watcher"
+            )
+
         logger.info(
-            "wallet_monitor: iniciado (poll={}s, wallets={})",
+            "wallet_monitor: iniciado (poll={}s, wallets={}, chain={})",
             self._poll_interval,
             len(self._reader.followed_addresses),
+            self._chain_watcher is not None,
         )
 
-        while not self._stop_event.is_set():
-            try:
-                await self._tick()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.critical(
-                    "wallet_monitor: exceção não tratada no tick — a re-raise",
-                    exc_info=True,
-                )
-                raise
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    await self._tick()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.critical(
+                        "wallet_monitor: exceção não tratada no tick — a re-raise",
+                        exc_info=True,
+                    )
+                    raise
 
-            try:
-                await asyncio.wait_for(
-                    self._stop_event.wait(), timeout=self._poll_interval
-                )
-            except asyncio.TimeoutError:
-                continue
+                try:
+                    await asyncio.wait_for(
+                        self._stop_event.wait(), timeout=self._poll_interval
+                    )
+                except asyncio.TimeoutError:
+                    continue
+        finally:
+            await self._stop_chain_watcher()
 
         logger.info("wallet_monitor: parado")
 
     def stop(self) -> None:
         self._stop_event.set()
+        if self._chain_watcher is not None:
+            self._chain_watcher.stop()
+
+    async def _stop_chain_watcher(self) -> None:
+        if self._chain_watcher is not None:
+            self._chain_watcher.stop()
+        if self._chain_task is not None:
+            self._chain_task.cancel()
+            try:
+                await self._chain_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            self._chain_task = None
 
     async def reload_followed_wallets(self) -> None:
         """Carrega as top-7 wallets seguidas a partir da DB (scoring mais recente)."""
         wallets = await self._load_followed_wallets()
         self._reader.replace_wallets(wallets)
+        if self._chain_watcher is not None:
+            self._chain_watcher.update_followed_wallets(wallets)
         logger.info(
             "wallet_monitor: {} wallets seguidas recarregadas", len(wallets)
         )

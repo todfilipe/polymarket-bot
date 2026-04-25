@@ -11,6 +11,14 @@ vista numa das duas funções NUNCA reaparece noutra (dedup partilhado).
 
 Concurrency: um `asyncio.Lock` por wallet garante que polls paralelos à mesma
 wallet não emitem duplicados nem corrompem o cursor.
+
+Modos de operação (`source`):
+- `"api"`     — só o polling à Data API (comportamento histórico).
+- `"chain"`   — só o `ChainWatcher` injecta sinais via `inject_signal()`.
+                Não toca na Data API.
+- `"both"`    — chain como fonte primária + Data API como verificação/fallback.
+                O dedup por `tx_hash` garante que sinais já vistos via chain
+                não reaparecem via API e vice-versa.
 """
 
 from __future__ import annotations
@@ -19,11 +27,15 @@ import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
+from typing import Literal
 
 from loguru import logger
 
 from polymarket_bot.api.polymarket_data import PolymarketDataClient, RawTrade
 from polymarket_bot.db.enums import TradeSide, WalletTier
+
+
+SignalSource = Literal["api", "chain", "both"]
 
 
 @dataclass(frozen=True)
@@ -66,11 +78,22 @@ class SignalReader:
         self,
         wallets: list[FollowedWallet],
         data_client: PolymarketDataClient,
+        source: SignalSource = "api",
     ):
         self._data_client = data_client
+        self._source = source
         self._wallets: dict[str, FollowedWallet] = {}
         self._cursors: dict[str, _WalletCursor] = {}
+        # Buffers preenchidos pelo `ChainWatcher` via `inject_signal()`. Drenados
+        # em cada `poll_once`/`poll_sells`; consenso natural se múltiplos sinais
+        # chegarem entre poll ticks.
+        self._chain_buys: list[DetectedSignal] = []
+        self._chain_sells: list[DetectedSignal] = []
         self.replace_wallets(wallets)
+
+    @property
+    def source(self) -> SignalSource:
+        return self._source
 
     def replace_wallets(self, wallets: list[FollowedWallet]) -> None:
         """Substitui o universo seguido. Cursores de wallets removidas são descartados;
@@ -107,18 +130,58 @@ class SignalReader:
         return await self._poll_all(side=TradeSide.SELL)
 
     async def _poll_all(self, *, side: TradeSide) -> list[DetectedSignal]:
-        results: list[list[DetectedSignal]] = await asyncio.gather(
-            *(self._poll_wallet(addr, side=side) for addr in self._wallets),
-            return_exceptions=False,
-        )
-        signals: list[DetectedSignal] = [s for batch in results for s in batch]
+        # Drena o buffer alimentado pelo ChainWatcher antes de tocar na API.
+        chain_signals = self._drain_chain_buffer(side=side)
+
+        # Em modo `chain`, NUNCA toca na Data API — evita lag artificial e
+        # desperdício de quota.
+        if self._source == "chain":
+            api_signals: list[DetectedSignal] = []
+        else:
+            results: list[list[DetectedSignal]] = await asyncio.gather(
+                *(self._poll_wallet(addr, side=side) for addr in self._wallets),
+                return_exceptions=False,
+            )
+            api_signals = [s for batch in results for s in batch]
+
+        signals = chain_signals + api_signals
         if signals:
             logger.info(
-                "signal_reader: {} {} sinal(is) novo(s) detectado(s)",
-                len(signals),
-                side.value,
+                "signal_reader: {} {} sinal(is) novo(s) "
+                "(chain={}, api={}, source={})",
+                len(signals), side.value,
+                len(chain_signals), len(api_signals), self._source,
             )
         return signals
+
+    def _drain_chain_buffer(self, *, side: TradeSide) -> list[DetectedSignal]:
+        if side == TradeSide.BUY:
+            buf, self._chain_buys = self._chain_buys, []
+        else:
+            buf, self._chain_sells = self._chain_sells, []
+        return buf
+
+    def inject_signal(self, signal: DetectedSignal) -> None:
+        """Buffer-push usado pelo `ChainWatcher`. Idempotente por `tx_hash`.
+
+        Ignora sinais de wallets que não estão actualmente seguidas — pode
+        acontecer se o ChainWatcher ainda não recebeu um update após
+        rebalanceamento.
+        """
+        addr = signal.wallet.address.lower()
+        cursor = self._cursors.get(addr)
+        if cursor is None:
+            return
+        if signal.tx_hash and signal.tx_hash in cursor.seen_tx_hashes:
+            return
+        if signal.tx_hash:
+            cursor.seen_tx_hashes.add(signal.tx_hash)
+        if signal.detected_at > cursor.last_seen_at:
+            cursor.last_seen_at = signal.detected_at
+        if signal.side == TradeSide.BUY:
+            self._chain_buys.append(signal)
+        else:
+            self._chain_sells.append(signal)
 
     async def _poll_wallet(
         self, address: str, *, side: TradeSide

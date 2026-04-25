@@ -68,7 +68,13 @@
       "Bash(curl -s \"https://data-api.polymarket.com/activity?user=0x492442eab586f242b53bda933fd5de859c8a3782&limit=3&offset=500\")",
       "Bash(python -c \"import py_compile; [py_compile.compile\\(p, doraise=True\\) for p in ['src/polymarket_bot/api/polymarket_data.py', 'src/polymarket_bot/wallets/metrics.py', 'src/polymarket_bot/wallets/discovery.py', 'scripts/force_rebalance.py']]; print\\('compile ok'\\)\")",
       "Bash(python -c \"import py_compile; [py_compile.compile\\(p, doraise=True\\) for p in ['src/polymarket_bot/api/polymarket_data.py', 'src/polymarket_bot/wallets/discovery.py', 'scripts/force_rebalance.py']]; print\\('compile ok'\\)\")",
-      "Bash(python -m pytest tests/unit/test_telegram_commander.py -x -v)"
+      "Bash(python -m pytest tests/unit/test_telegram_commander.py -x -v)",
+      "Bash(python -c \"import eth_utils; print\\(eth_utils.keccak\\(text='OrderFilled\\(bytes32,address,address,uint256,uint256,uint256,uint256,uint256\\)'\\).hex\\(\\)\\)\")",
+      "Bash(python -c \"import websockets; print\\(websockets.__version__\\); import web3; print\\(web3.__version__\\)\")",
+      "Bash(python -m pytest tests/unit/test_chain_watcher.py tests/unit/test_signal_reader.py -x -q)",
+      "Bash(python -m pytest -q)",
+      "Bash(python -m polymarket_bot.main --dry-run-check)",
+      "Bash(PYTHONPATH=src python -c \"from polymarket_bot.main import main; from polymarket_bot.monitoring.chain_watcher import ChainWatcher, MarketIdResolver; print\\('imports ok'\\)\")"
     ]
   }
 }
