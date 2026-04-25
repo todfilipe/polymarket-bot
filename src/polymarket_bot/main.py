@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import signal
 import sys
+from datetime import datetime, timezone
 from decimal import Decimal
 
 import aiohttp
@@ -32,6 +33,7 @@ from polymarket_bot.monitoring.exit_manager import ExitManager
 from polymarket_bot.monitoring.market_builder import MarketBuilder
 from polymarket_bot.monitoring.signal_reader import SignalReader
 from polymarket_bot.monitoring.wallet_monitor import WalletMonitor
+from polymarket_bot.notifications.telegram_commander import TelegramCommander
 from polymarket_bot.notifications.telegram_notifier import TelegramNotifier
 from polymarket_bot.portfolio.exposure_guard import ExposureGuard
 from polymarket_bot.portfolio.portfolio_manager import PortfolioManager
@@ -166,6 +168,8 @@ async def main() -> None:
         signal_reader=signal_reader,
         bankroll_provider=lambda _sm: portfolio.get_bankroll(),
         exit_manager=exit_manager,
+        notifier=notifier,
+        live_mode=settings.live_mode,
     )
     scheduler = RebalancingScheduler(
         monitor=monitor,
@@ -185,6 +189,21 @@ async def main() -> None:
 
     scheduler.start()
 
+    commander = TelegramCommander(
+        bot_token=settings.telegram_bot_token.get_secret_value(),
+        allowed_chat_id=settings.telegram_chat_id,
+        session=http_session,
+        session_factory=sessionmaker,
+        monitor=monitor,
+        circuit_breaker=circuit_breaker,
+        started_at=datetime.now(timezone.utc),
+        live_mode=settings.live_mode,
+        market_builder=market_builder,
+    )
+    commander_task = asyncio.create_task(
+        commander.run_forever(), name="telegram_commander"
+    )
+
     try:
         await notifier.send(
             f"🤖 Bot iniciado | modo: {mode} | wallets: {n_followed}"
@@ -199,6 +218,12 @@ async def main() -> None:
     except (asyncio.CancelledError, KeyboardInterrupt):
         logger.info("bot: sinal de shutdown recebido")
     finally:
+        commander.stop()
+        commander_task.cancel()
+        try:
+            await commander_task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
         scheduler.stop()
         try:
             await notifier.send("🔴 Bot encerrado")

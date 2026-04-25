@@ -42,6 +42,7 @@ from polymarket_bot.db.models import (
 from polymarket_bot.execution.pipeline import (
     ExecutionPipeline,
     PipelineContext,
+    PipelineOutcome,
     SignalInput,
 )
 from polymarket_bot.market import WalletSignal
@@ -52,6 +53,7 @@ from polymarket_bot.monitoring.signal_reader import (
     FollowedWallet,
     SignalReader,
 )
+from polymarket_bot.notifications.telegram_notifier import TelegramNotifier
 
 
 @dataclass(frozen=True)
@@ -82,6 +84,8 @@ class WalletMonitor:
         signal_reader: SignalReader | None = None,
         bankroll_provider: BankrollProvider | None = None,
         exit_manager: ExitManager | None = None,
+        notifier: TelegramNotifier | None = None,
+        live_mode: bool = False,
     ):
         self._pipeline = pipeline
         self._data_client = data_client
@@ -93,6 +97,8 @@ class WalletMonitor:
         )
         self._bankroll_provider = bankroll_provider or self._default_bankroll
         self._exit_manager = exit_manager
+        self._notifier = notifier
+        self._live_mode = live_mode
         self._stop_event = asyncio.Event()
 
     # ------------------------------------------------------------------ public
@@ -230,6 +236,22 @@ class WalletMonitor:
             result.outcome.value,
             result.reason or "-",
         )
+
+        if self._notifier is not None:
+            try:
+                if result.outcome == PipelineOutcome.EXECUTED:
+                    await self._notifier.trade_executed(
+                        result=result,
+                        market_question=market.question,
+                        is_paper=not self._live_mode,
+                    )
+                else:
+                    await self._notifier.trade_skipped(
+                        result=result,
+                        market_question=market.question,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("wallet_monitor: falha a notificar Telegram — {}", exc)
 
     # ------------------------------------------------------------------ helpers
     @staticmethod
