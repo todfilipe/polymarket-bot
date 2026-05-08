@@ -144,8 +144,27 @@ class MarketBuilder:
         reraise=True,
     )
     async def _fetch_market(self, market_id: str) -> dict[str, Any]:
-        url = f"{self._gamma_url}/markets/{market_id}"
-        data = await self._get(url)
+        """Resolve um market via Gamma API.
+
+        ``market_id`` aceita formato bytes32 (``conditionId`` 0x...) ou o id
+        numérico interno do Gamma. O endpoint path ``/markets/{id}`` só aceita
+        o id numérico — para ``conditionId`` usa-se o query ``?condition_ids=``
+        que devolve uma lista. Tentamos a query primeiro (cobre os dois casos
+        em produção, já que `chain_watcher` passa o ``conditionId``); só se
+        falhar caímos no path.
+        """
+        if str(market_id).lower().startswith("0x"):
+            url = f"{self._gamma_url}/markets"
+            payload = await self._get(url, params={"condition_ids": market_id})
+            if not isinstance(payload, list) or not payload:
+                raise MarketBuildError(
+                    f"market não encontrado em Gamma para condition_id={market_id!r}"
+                )
+            data = payload[0]
+        else:
+            url = f"{self._gamma_url}/markets/{market_id}"
+            data = await self._get(url)
+
         if not isinstance(data, dict):
             raise MarketBuildError(f"resposta Gamma inesperada para {market_id!r}")
         return data

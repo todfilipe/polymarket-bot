@@ -220,6 +220,36 @@ async def test_outcome_not_in_market_raises():
 
 
 @pytest.mark.asyncio
+async def test_market_id_as_condition_id_uses_query_param():
+    """Quando market_id é bytes32 (conditionId 0x...), o builder usa
+    o endpoint ``GET /markets?condition_ids=0x...`` (que devolve lista)
+    em vez de ``GET /markets/0x...`` (que dá 422 em produção).
+    """
+    cid = "0x7d14190f8d9762f2651010055481b2261aac06592dceee91b3c9284cf33aeaa5"
+    gamma = _make_gamma_payload(market_id=cid)
+
+    captured_calls: list[tuple[str, dict | None]] = []
+
+    async def fake_get(url: str, params=None):
+        captured_calls.append((url, params))
+        if url.endswith("/markets") and params and "condition_ids" in params:
+            return [gamma]
+        if url.endswith("/book"):
+            return _make_book_payload()
+        raise AssertionError(f"URL inesperada: {url} params={params}")
+
+    builder = MarketBuilder(gamma_url="http://g", clob_url="http://c")
+    _install_get_mock(builder, fake_get)
+
+    snapshot = await builder.build(cid, "YES")
+    assert snapshot.market_id == cid
+    # Confirma que NÃO foi usado /markets/{cid} no path
+    assert not any(u.endswith(f"/markets/{cid}") for u, _ in captured_calls)
+    # Confirma que foi usada a query
+    assert any(p and p.get("condition_ids") == cid for _, p in captured_calls)
+
+
+@pytest.mark.asyncio
 async def test_negrisk_multi_outcome_resolves_correct_token():
     """Mercado multi-outcome (Polymarket NegRisk) — match por nome.
 
