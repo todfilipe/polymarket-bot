@@ -30,22 +30,32 @@ from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from sqlalchemy.exc import IntegrityError
+
 from polymarket_bot.api.polymarket_data import PolymarketDataClient
 from polymarket_bot.config.constants import CONST
-from polymarket_bot.db.enums import CircuitBreakerStatus, WalletTier
+from polymarket_bot.db.enums import (
+    BotTradeStatus,
+    CircuitBreakerStatus,
+    TradeSide,
+    WalletTier,
+)
 from polymarket_bot.db.models import (
+    BotTrade,
     CircuitBreakerState,
     Position,
     Wallet,
     WalletScore,
 )
+from polymarket_bot.execution.dedup import compute_dedup_hash
 from polymarket_bot.execution.pipeline import (
     ExecutionPipeline,
     PipelineContext,
     PipelineOutcome,
+    PipelineResult,
     SignalInput,
 )
-from polymarket_bot.market import WalletSignal
+from polymarket_bot.market import MarketSnapshot, WalletSignal
 from polymarket_bot.monitoring.chain_watcher import ChainWatcher
 from polymarket_bot.monitoring.exit_manager import ExitManager
 from polymarket_bot.monitoring.market_builder import MarketBuilder, MarketBuildError
@@ -265,6 +275,20 @@ class WalletMonitor:
             result.reason or "-",
         )
 
+        # Persistência de skips: o `OrderManager` só grava `BotTrade` quando há
+        # tentativa de execução, pelo que sinais rejeitados antes (filtros,
+        # EV, depth, etc.) não apareciam no `/skips` apesar de notificados.
+        # Replicamos aqui o registo para ter histórico consistente.
+        if result.outcome != PipelineOutcome.EXECUTED:
+            try:
+                await self._persist_skipped_trade(
+                    market=market, group=group, result=result
+                )
+            except Exception as exc:  # noqa: BLE001 — best effort, não parar loop
+                log.warning(
+                    "wallet_monitor: falha a persistir skip — {}", exc
+                )
+
         if self._notifier is not None:
             try:
                 if result.outcome == PipelineOutcome.EXECUTED:
@@ -280,6 +304,71 @@ class WalletMonitor:
                     )
             except Exception as exc:  # noqa: BLE001
                 log.warning("wallet_monitor: falha a notificar Telegram — {}", exc)
+
+    async def _persist_skipped_trade(
+        self,
+        *,
+        market: MarketSnapshot,
+        group: list[DetectedSignal],
+        result: PipelineResult,
+    ) -> None:
+        """Grava ``BotTrade(status=SKIPPED)`` para sinais rejeitados pelo pipeline.
+
+        Usa a primeira wallet do grupo como representante. O ``intended_price``
+        é o melhor ask se disponível (entradas são BUYs) — caso contrário 0.
+        ``size_usd`` e ``expected_value`` vêm dos artefactos do pipeline quando
+        existem; se a rejeição foi cedo (ex.: filtros de mercado), usam-se 0.
+
+        Idempotente por ``dedup_hash``: se já existe registo no mesmo minuto
+        para a mesma wallet/market/side, ignora silenciosamente.
+        """
+        first = group[0]
+        wallet_addr = first.wallet.address.lower()
+        side: TradeSide = first.side
+
+        size_usd = (
+            result.size.size_usd if result.size is not None else Decimal("0")
+        )
+        expected_value = (
+            float(result.ev.expected_value) if result.ev is not None else 0.0
+        )
+        best_ask = market.orderbook.best_ask if market.orderbook else None
+        intended_price = best_ask if best_ask is not None else Decimal("0")
+        skip_reason = (result.reason or result.outcome.value)[:200]
+
+        dedup_hash = compute_dedup_hash(
+            wallet_address=wallet_addr,
+            market_id=market.market_id,
+            side=side,
+            outcome=market.outcome,
+        )
+
+        async with self._sessionmaker() as session:
+            trade = BotTrade(
+                dedup_hash=dedup_hash,
+                is_paper=not self._live_mode,
+                followed_wallet_address=wallet_addr,
+                market_id=market.market_id,
+                side=side,
+                outcome=market.outcome,
+                intended_price=intended_price,
+                executed_price=None,
+                size_usd=size_usd,
+                slippage=None,
+                expected_value=expected_value,
+                status=BotTradeStatus.SKIPPED,
+                skip_reason=skip_reason,
+                clob_order_id=None,
+                submitted_at=None,
+                executed_at=None,
+            )
+            session.add(trade)
+            try:
+                await session.commit()
+            except IntegrityError:
+                # Mesmo dedup_hash já existe (mesma trade no mesmo minuto) —
+                # `/skips` já tem o registo, não duplicamos.
+                await session.rollback()
 
     # ------------------------------------------------------------------ helpers
     @staticmethod

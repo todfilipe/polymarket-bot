@@ -29,8 +29,8 @@ class TestMarketFilters:
         assert any("volume" in r for r in result.reasons)
 
     def test_too_soon_fails(self):
-        # 10h até resolução
-        snap = make_snapshot(days_to_resolution=10 / 24)
+        # 30 min até resolução — abaixo do MIN_HOURS_TO_RESOLUTION (1h actual).
+        snap = make_snapshot(days_to_resolution=0.5 / 24)
         result = check_market_filters(snap)
         assert not result.passes
         assert any("tempo" in r and "mín" in r for r in result.reasons)
