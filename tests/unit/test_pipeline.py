@@ -107,39 +107,23 @@ class TestPipelineHappyPath:
 
 class TestPipelineSkips:
     @pytest.mark.asyncio
-    async def test_skipped_consensus_on_empty_signals(self):
+    async def test_empty_signals_skips_via_size(self):
+        """Sem sinais, consensus aborta (multipliers=0) → size cai abaixo do
+        mínimo → SKIPPED_SIZE (já não há gate explícito de consenso)."""
         om = FakeOrderManager()
         pipeline = ExecutionPipeline(order_manager=om)
 
         result = await pipeline.evaluate(_ctx([]))
 
-        assert result.outcome == PipelineOutcome.SKIPPED_CONSENSUS
-        assert result.consensus is not None
-        assert not result.consensus.should_enter
+        assert result.outcome == PipelineOutcome.SKIPPED_SIZE
         assert om.calls == []
 
     @pytest.mark.asyncio
-    async def test_skipped_consensus_on_opposite_directions(self):
+    async def test_low_volume_executes_in_pure_copytrade_mode(self):
+        """Volume baixo já não bloqueia — modo copytrade puro segue o sinal."""
         om = FakeOrderManager()
         pipeline = ExecutionPipeline(order_manager=om)
-        ctx = _ctx(
-            [
-                _signal_input("0xA", WalletTier.TOP, "YES", 0.70),
-                _signal_input("0xB", WalletTier.TOP, "NO", 0.70),
-            ]
-        )
-
-        result = await pipeline.evaluate(ctx)
-
-        assert result.outcome == PipelineOutcome.SKIPPED_CONSENSUS
-        assert "opostas" in (result.reason or "")
-        assert om.calls == []
-
-    @pytest.mark.asyncio
-    async def test_skipped_market_filters_low_volume(self):
-        om = FakeOrderManager()
-        pipeline = ExecutionPipeline(order_manager=om)
-        snapshot = make_snapshot(volume_usd="10000", depth_size="5000")  # < $50k
+        snapshot = make_snapshot(volume_usd="10000", depth_size="5000")
         ctx = _ctx(
             [_signal_input("0xA", WalletTier.TOP, "YES", 0.65)],
             snapshot=snapshot,
@@ -147,26 +131,21 @@ class TestPipelineSkips:
 
         result = await pipeline.evaluate(ctx)
 
-        assert result.outcome == PipelineOutcome.SKIPPED_MARKET_FILTERS
-        assert "volume" in (result.reason or "")
-        assert result.market_filters is not None
-        assert not result.market_filters.passes
-        assert om.calls == []
+        assert result.outcome == PipelineOutcome.EXECUTED
+        assert len(om.calls) == 1
 
     @pytest.mark.asyncio
-    async def test_skipped_ev_when_edge_too_small(self):
-        """Wallet solo com win rate 55% @ preço 0.40 → margin < 10%."""
+    async def test_low_ev_executes_in_pure_copytrade_mode(self):
+        """EV abaixo do mínimo já não bloqueia — modo copytrade puro
+        confia que a wallet tem alpha que o nosso EV não capta."""
         om = FakeOrderManager()
         pipeline = ExecutionPipeline(order_manager=om)
         ctx = _ctx([_signal_input("0xA", WalletTier.TOP, "YES", 0.55)])
 
         result = await pipeline.evaluate(ctx)
 
-        assert result.outcome == PipelineOutcome.SKIPPED_EV
-        assert result.ev is not None
-        assert not result.ev.passes_min_margin
-        assert result.probability_estimate is not None
-        assert om.calls == []
+        assert result.outcome == PipelineOutcome.EXECUTED
+        assert len(om.calls) == 1
 
     @pytest.mark.asyncio
     async def test_skipped_size_low_bankroll_solo_bottom(self):

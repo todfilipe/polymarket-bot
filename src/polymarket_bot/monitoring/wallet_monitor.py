@@ -253,6 +253,7 @@ class WalletMonitor:
                     outcome=s.outcome,
                 ),
                 win_rate=s.wallet.win_rate,
+                tx_hash=s.tx_hash,
             )
             for s in group
         ]
@@ -336,16 +337,15 @@ class WalletMonitor:
         intended_price = best_ask if best_ask is not None else Decimal("0")
         skip_reason = (result.reason or result.outcome.value)[:200]
 
-        # Sufixo ":SK<outcome>" no hash garante que a row de SKIPPED nunca
-        # colide com a de uma execução com mesmo (wallet, market, side, minuto).
-        # ``outcome`` no sufixo distingue ainda skips de outcomes diferentes
-        # do mesmo evento (ex.: SKIPPED_DUPLICATE vs SKIPPED_EV no mesmo
-        # minuto). Trim a 80 chars (limite do campo).
+        # Hash baseado no tx_hash do sinal + sufixo ":SK:<outcome>" para nunca
+        # colidir com a row da execução desse mesmo tx (que usa o hash sem
+        # sufixo). Limite de 80 chars do campo respeitado.
         base_hash = compute_dedup_hash(
             wallet_address=wallet_addr,
             market_id=market.market_id,
             side=side,
             outcome=market.outcome,
+            tx_hash=first.tx_hash or "",
         )
         suffix = f":SK:{result.outcome.value[:20]}"
         dedup_hash = (base_hash + suffix)[:80]

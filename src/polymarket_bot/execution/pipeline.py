@@ -64,6 +64,7 @@ class SignalInput:
 
     signal: WalletSignal
     win_rate: float             # win rate histórico da wallet (do scoring)
+    tx_hash: str = ""           # tx on-chain originária — alimenta o dedup
 
 
 @dataclass(frozen=True)
@@ -104,57 +105,35 @@ class ExecutionPipeline:
         self._exposure_guard = exposure_guard
 
     async def evaluate(self, ctx: PipelineContext) -> PipelineResult:
+        """Modo "copytrade puro": só fica entre o sinal e a execução o que é
+        protecção de **capital** (sizing cap, exposure, dedup, depth físico).
+
+        Removidos os filtros de **alpha** — EV mínimo, volume mínimo, janela
+        de probabilidade, tempo até resolução, regra de consenso.
+        Hipótese: as wallets seguidas são lucrativas precisamente pelo conjunto
+        das suas trades; filtrar selectivamente cortava alpha sem garantia de
+        melhoria. Risco controlado por size cap + exposure + stop loss.
+        """
         log = logger.bind(market_id=ctx.market.market_id)
 
-        # ---- 1. Consenso ----
+        # Consenso é executado apenas para extrair multiplicadores de sizing;
+        # nunca aborta — sinais já vêm agrupados por (market, outcome) pelo
+        # `wallet_monitor`, pelo que conflito YES/NO não pode ocorrer aqui.
         wallet_signals = [s.signal for s in ctx.signals]
         consensus = analyze_consensus(wallet_signals)
-        if not consensus.should_enter:
-            log.info("skip: consensus — {}", consensus.reason)
-            return PipelineResult(
-                outcome=PipelineOutcome.SKIPPED_CONSENSUS,
-                reason=consensus.reason,
-                consensus=consensus,
-            )
 
-        # ---- 2. Filtros de mercado ----
-        mf = check_market_filters(ctx.market)
-        if not mf.passes:
-            reason = "; ".join(mf.reasons)
-            log.info("skip: market filters — {}", reason)
-            return PipelineResult(
-                outcome=PipelineOutcome.SKIPPED_MARKET_FILTERS,
-                reason=reason,
-                consensus=consensus,
-                market_filters=mf,
-            )
-
-        # ---- 3. Probability + EV margin ----
+        # Probability estimate e EV — só para LOGS/audit, não rejeitam.
         market_price = ctx.market.implied_probability
-        assert market_price is not None  # garantido por check_market_filters
-
-        prob_estimate = estimate_true_probability(
-            market_price=market_price,
-            win_rates=[s.win_rate for s in ctx.signals],
-        )
-        # EV margin é size-independent — usamos stake dummy $1 só para margin check
-        ev_preview = compute_ev(
-            stake_usd=Decimal("1"),
-            entry_price=market_price,
-            true_probability=prob_estimate.estimated_probability,
-        )
-        if not ev_preview.passes_min_margin:
-            log.info("skip: EV — {}", ev_preview.reason)
-            return PipelineResult(
-                outcome=PipelineOutcome.SKIPPED_EV,
-                reason=ev_preview.reason,
-                consensus=consensus,
-                market_filters=mf,
-                probability_estimate=prob_estimate,
-                ev=ev_preview,
+        prob_estimate = (
+            estimate_true_probability(
+                market_price=market_price,
+                win_rates=[s.win_rate for s in ctx.signals],
             )
+            if market_price is not None
+            else None
+        )
 
-        # ---- 4. Sizing ----
+        # ---- 1. Sizing (8% cap, tier weights, signal multiplier) ----
         size_decision = compute_size(ctx.bankroll_usd, consensus, ctx.recovery_mode)
         if not size_decision.should_execute:
             log.info("skip: size — {}", size_decision.skip_reason)
@@ -162,20 +141,21 @@ class ExecutionPipeline:
                 outcome=PipelineOutcome.SKIPPED_SIZE,
                 reason=size_decision.skip_reason,
                 consensus=consensus,
-                market_filters=mf,
                 probability_estimate=prob_estimate,
-                ev=ev_preview,
                 size=size_decision,
             )
 
-        # EV recomputed com o stake real (valor em USD para logs)
-        ev = compute_ev(
-            stake_usd=size_decision.final_size_usd,
-            entry_price=market_price,
-            true_probability=prob_estimate.estimated_probability,
+        ev = (
+            compute_ev(
+                stake_usd=size_decision.final_size_usd,
+                entry_price=market_price,
+                true_probability=prob_estimate.estimated_probability,
+            )
+            if (market_price is not None and prob_estimate is not None)
+            else None
         )
 
-        # ---- 5. Orderbook depth ----
+        # ---- 2. Orderbook depth (realidade física: fill com slippage razoável) ----
         depth = check_orderbook_depth(
             ctx.market.orderbook,
             size_decision.final_size_usd,
@@ -187,14 +167,13 @@ class ExecutionPipeline:
                 outcome=PipelineOutcome.SKIPPED_DEPTH,
                 reason=depth.reason,
                 consensus=consensus,
-                market_filters=mf,
                 probability_estimate=prob_estimate,
                 ev=ev,
                 size=size_decision,
                 depth=depth,
             )
 
-        # ---- 5.5 Exposure guard (limites de portfolio) ----
+        # ---- 3. Exposure guard (15%/evento, cash reserve 30%, máx 10 abertas) ----
         if self._exposure_guard is not None:
             exposure = await self._exposure_guard.check(
                 market=ctx.market,
@@ -207,30 +186,36 @@ class ExecutionPipeline:
                     outcome=PipelineOutcome.SKIPPED_EXPOSURE,
                     reason=exposure.reason,
                     consensus=consensus,
-                    market_filters=mf,
                     probability_estimate=prob_estimate,
                     ev=ev,
                     size=size_decision,
                     depth=depth,
                 )
 
-        # ---- 6. Dedup hash + submit ----
-        assert consensus.direction_outcome is not None
+        # ---- 4. Dedup hash + submit ----
+        # ``consensus.direction_outcome`` é sempre não-None: signals já vêm
+        # agrupados por outcome e analyze_consensus só aborta com 0 sinais
+        # ou outcomes opostos — nenhum dos quais ocorre por construção aqui.
+        outcome_dir = consensus.direction_outcome or ctx.market.outcome
         followed_addr = ctx.signals[0].signal.wallet_address
+        # Dedup baseado no tx_hash on-chain do primeiro sinal — garante
+        # idempotência por fill sem bloquear momentum-adds da mesma wallet.
+        tx_hash = ctx.signals[0].tx_hash or ""
         dedup = compute_dedup_hash(
             wallet_address=followed_addr,
             market_id=ctx.market.market_id,
             side=TradeSide.BUY,
-            outcome=consensus.direction_outcome,
+            outcome=outcome_dir,
+            tx_hash=tx_hash,
         )
 
         submission = await self._order_manager.submit(
             market=ctx.market,
-            outcome=consensus.direction_outcome,
+            outcome=outcome_dir,
             side=TradeSide.BUY,
             size_usd=size_decision.final_size_usd,
-            intended_price=depth.avg_fill_price or market_price,
-            expected_value=float(ev.margin),
+            intended_price=depth.avg_fill_price or market_price or Decimal("0"),
+            expected_value=float(ev.margin) if ev is not None else 0.0,
             followed_wallet=followed_addr,
             dedup_hash=dedup,
         )
@@ -240,7 +225,6 @@ class ExecutionPipeline:
                 outcome=PipelineOutcome.SKIPPED_DUPLICATE,
                 reason="hash já existente na janela de dedup",
                 consensus=consensus,
-                market_filters=mf,
                 probability_estimate=prob_estimate,
                 ev=ev,
                 size=size_decision,
@@ -254,7 +238,6 @@ class ExecutionPipeline:
                 outcome=PipelineOutcome.FAILED,
                 reason=submission.reason,
                 consensus=consensus,
-                market_filters=mf,
                 probability_estimate=prob_estimate,
                 ev=ev,
                 size=size_decision,
@@ -267,7 +250,6 @@ class ExecutionPipeline:
             outcome=PipelineOutcome.EXECUTED,
             reason=None,
             consensus=consensus,
-            market_filters=mf,
             probability_estimate=prob_estimate,
             ev=ev,
             size=size_decision,

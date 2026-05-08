@@ -1,8 +1,14 @@
 """Prevenção de trades duplicadas (§9.2).
 
-Hash único por trade: `wallet_address + market_id + side + outcome + minuto_timestamp`.
-Antes de executar qualquer ordem, verificar se o hash já existe na base de dados
-dentro da janela de `DEDUP_WINDOW_MINUTES`. Se sim, ignorar como duplicado.
+Hash único por trade baseado no ``tx_hash`` da transacção on-chain. Cada fill
+on-chain tem um `tx_hash` único na blockchain, pelo que esta é a granularidade
+ideal: o mesmo fill nunca executa duas vezes (idempotência), mas dois fills
+distintos da mesma wallet no mesmo mercado (e.g., momentum adds) ficam com
+hashes diferentes e são processados separadamente.
+
+Antes era usado um bucket de minuto que conflua momentum-adds legítimos com
+duplicações. Mudámos para tx_hash em alinhamento com o modo "copytrade puro"
+— seguir tudo o que as wallets fazem on-chain.
 
 O hash é determinístico (sha256 truncado) para facilitar debugging nos logs.
 """
@@ -25,17 +31,17 @@ def compute_dedup_hash(
     market_id: str,
     side: TradeSide,
     outcome: str,
-    timestamp: datetime | None = None,
+    tx_hash: str,
 ) -> str:
-    """Gera hash determinístico truncado a minuto.
+    """Gera hash determinístico baseado no ``tx_hash`` on-chain.
 
-    Duas chamadas no mesmo minuto com mesmos parâmetros → mesmo hash.
-    Chamadas espaçadas > 1 minuto → hashes diferentes (permite re-entry
-    legítima após a janela de dedup).
+    Mesma `tx_hash` (mesmo fill) → mesmo hash → bloqueio de re-execução.
+    Diferentes `tx_hash` → hashes diferentes → permite momentum adds.
     """
-    ts = timestamp or datetime.now(timezone.utc)
-    minute_bucket = ts.replace(second=0, microsecond=0).isoformat()
-    payload = f"{wallet_address.lower()}|{market_id}|{side.value}|{outcome.upper()}|{minute_bucket}"
+    payload = (
+        f"{wallet_address.lower()}|{market_id}|{side.value}|"
+        f"{outcome.upper()}|{tx_hash.lower()}"
+    )
     return hashlib.sha256(payload.encode()).hexdigest()[:32]
 
 

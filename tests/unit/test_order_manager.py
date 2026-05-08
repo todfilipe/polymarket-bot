@@ -64,6 +64,7 @@ def _submit_kwargs(dedup_hash: str | None = None):
             market_id=market.market_id,
             side=TradeSide.BUY,
             outcome="YES",
+            tx_hash="0xtest",
         ),
     )
 
@@ -207,6 +208,7 @@ def _live_submit_kwargs():
             market_id=market.market_id,
             side=TradeSide.BUY,
             outcome="YES",
+            tx_hash="0xlive",
         ),
     )
 
