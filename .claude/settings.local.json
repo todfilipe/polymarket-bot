@@ -75,7 +75,14 @@
       "Bash(python -m pytest -q)",
       "Bash(python -m polymarket_bot.main --dry-run-check)",
       "Bash(PYTHONPATH=src python -c \"from polymarket_bot.main import main; from polymarket_bot.monitoring.chain_watcher import ChainWatcher, MarketIdResolver; print\\('imports ok'\\)\")",
-      "Bash(python -m pytest tests/unit/test_chain_watcher.py -v)"
+      "Bash(python -m pytest tests/unit/test_chain_watcher.py -v)",
+      "PowerShell(python --version)",
+      "PowerShell(python -c \"import polymarket_bot; print\\('OK:', polymarket_bot.__file__\\)\" 2>&1)",
+      "PowerShell(Get-ChildItem \"C:\\\\Users\\\\fnrs1\\\\OneDrive\\\\Documentos\\\\Claude\\\\Projects\\\\polymarket bot\" -Directory | Where-Object { $_.Name -match 'venv|env|\\\\.venv' } | Select-Object Name, FullName)",
+      "PowerShell($proj = \"C:\\\\Users\\\\fnrs1\\\\OneDrive\\\\Documentos\\\\Claude\\\\Projects\\\\polymarket bot\"; Set-Location $proj; python -m venv .venv; Write-Host \"venv criado em: $proj\\\\.venv\")",
+      "PowerShell($proj = \"C:\\\\Users\\\\fnrs1\\\\OneDrive\\\\Documentos\\\\Claude\\\\Projects\\\\polymarket bot\"; & \"$proj\\\\.venv\\\\Scripts\\\\python.exe\" -m pip install --upgrade pip --quiet 2>&1 | Select-Object -Last 5)",
+      "WebFetch(domain:www.4byte.directory)",
+      "Bash(git -C . branch --show-current)"
     ]
   }
 }

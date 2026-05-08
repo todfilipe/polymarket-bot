@@ -1,9 +1,9 @@
 """Detecção em tempo real de trades via Polygon RPC.
 
 Substitui o polling à Polymarket Data API (1h+ de lag) por leitura directa
-do contrato CTF Exchange em Polygon. Cada trade emite um `OrderFilled` com
-`maker`/`taker` indexados — filtramos pelos endereços (proxy wallets) das
-wallets seguidas.
+dos contratos Polymarket Exchange V2 em Polygon. Cada trade emite um
+`OrderFilled` com `maker`/`taker` indexados — filtramos pelos endereços
+(proxy wallets) das wallets seguidas.
 
 Modos de operação:
 - WebSocket (`eth_subscribe('logs', ...)`) — deteção sub-segundo, preferido.
@@ -13,18 +13,27 @@ Após restart, processa eventos dos últimos 5 minutos via `eth_getLogs` para
 não perder trades que ocorreram durante o downtime.
 
 Decoding do evento (sem dependência adicional de ABI):
+- assinatura: ``OrderFilled(bytes32,address,address,uint8,uint256,uint256,
+                            uint256,uint256,bytes32,bytes32)``
 - topic[0] = keccak256(assinatura)
 - topic[1] = orderHash (bytes32)
 - topic[2] = maker (address, padded 32 bytes)
 - topic[3] = taker (address, padded 32 bytes)
-- data    = makerAssetId, takerAssetId, makerAmountFilled, takerAmountFilled, fee
-            (5 × uint256, big-endian)
+- data    = side (uint8 padded), tokenId, makerAmountFilled, takerAmountFilled,
+            fee, builder (bytes32), metadata (bytes32) — 7 × 32 bytes
 
 Side / token / price:
-- Quem GIVES USDC (assetId == 0) está a comprar (BUY); quem GIVES shares (assetId != 0)
-  está a vender (SELL). O `token_id` é o assetId não-zero.
-- price = (USDC amount) / (shares amount). USDC e shares partilham 6 decimais
-  no Polymarket, pelo que a divisão fica unitless ≈ probabilidade ∈ [0,1].
+- ``side`` na posição 0 do data é o lado do maker (0 = BUY, 1 = SELL).
+- **Filtragem só por maker.** Quando a wallet seguida aparece como maker, o
+  ``tokenId`` e o ``side`` referem-se à ordem que ela assinou. Quando aparece
+  como taker, é uma ordem da contraparte — em mercados binários, o tokenId é
+  o complementar YES↔NO e o side é o oposto, pelo que matchar-taker emitiria
+  sinal com mercado e direcção invertidos. O operator de Polymarket emite
+  sempre OrderFilled com a wallet como maker para a ordem que ela assinou,
+  pelo que esta filtragem é completa.
+- price = USDC amount / shares amount. side=BUY: maker paga USDC = makerAmount,
+  recebe shares = takerAmount. side=SELL: o inverso. USDC e shares partilham
+  6 decimais no Polymarket → divisão unitless ≈ probabilidade ∈ [0,1].
 """
 
 from __future__ import annotations
@@ -47,24 +56,32 @@ from polymarket_bot.monitoring.signal_reader import (
 )
 
 
-# Endereço oficial do CTF Exchange em Polygon mainnet (Polymarket).
-POLYMARKET_CTF_EXCHANGE = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
+# Polymarket: CTF Exchange V2 — mercados binários YES/NO.
+POLYMARKET_CTF_EXCHANGE = "0xe111180000d2663c0091e4f400237545b87b996b"
 
-# Endereço do Neg Risk Exchange — alguns mercados (e.g. multi-outcome) usam-no.
-POLYMARKET_NEG_RISK_EXCHANGE = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
+# Polymarket: Neg Risk CTF Exchange V2 — mercados multi-outcome.
+POLYMARKET_NEG_RISK_EXCHANGE = "0xe2222d279d744050d28e00520010520000310f59"
 
 _ORDER_FILLED_SIG = (
-    "OrderFilled(bytes32,address,address,uint256,uint256,uint256,uint256,uint256)"
+    "OrderFilled(bytes32,address,address,uint8,uint256,uint256,uint256,uint256,"
+    "bytes32,bytes32)"
 )
 ORDER_FILLED_TOPIC = "0x" + keccak(text=_ORDER_FILLED_SIG).hex()
+
+# Side enum no contrato Solidity: 0 = BUY, 1 = SELL. Refere o lado do MAKER.
+_SIDE_BUY = 0
+_SIDE_SELL = 1
 
 # Polygon: ~2s/block. 5min ≈ 150 blocos. Damos folga generosa.
 _REPLAY_BLOCKS = 200
 _HTTP_POLL_INTERVAL_SECONDS = 15
 _WS_RECONNECT_INITIAL_DELAY = 1.0
 _WS_RECONNECT_MAX_DELAY = 60.0
-# eth_getLogs em providers públicos costuma rejeitar ranges > 1000 blocos.
-_MAX_LOG_RANGE = 500
+# eth_getLogs em RPCs públicos: Polymarket emite ~150 OrderFilled/bloco no V2.
+# 500 blocos → ~75k logs → timeout em endpoints públicos. 100 blocos → ~15k,
+# manejável. Providers privados (Alchemy/Infura) suportam mais, mas mantemos
+# 100 como default seguro.
+_MAX_LOG_RANGE = 100
 
 
 SignalCallback = Callable[[DetectedSignal], Awaitable[None]]
@@ -72,15 +89,24 @@ MarketResolver = Callable[[str], Awaitable[tuple[str, str] | None]]
 
 
 class MarketIdResolver:
-    """Cache de `token_id → (market_id, outcome)` via Polymarket CLOB API.
+    """Cache de `token_id → (market_id, outcome)` via Polymarket Gamma API.
 
-    Endpoint: ``GET <clob_url>/markets/<token_id>``. Resposta inclui
-    ``condition_id`` e ``tokens: [{token_id, outcome}, ...]``.
+    Endpoint: ``GET <gamma_url>/markets?clob_token_ids=<token_id>`` — devolve
+    uma lista de markets contendo ``conditionId``, ``outcomes`` (array com os
+    nomes em ordem: binários ``["Yes","No"]``, NegRisk ``["Fenerbahce", ...]``)
+    e ``clobTokenIds`` (array dos token IDs alinhado com ``outcomes``).
+    Mapeamos o ``token_id`` recebido pelo seu índice em ``clobTokenIds`` para
+    extrair o nome do outcome.
+
+    Antes era usado o endpoint ``<clob_url>/markets/<token_id>`` mas isso devolve
+    404 desde a migração para os contratos V2 — o CLOB indexa por
+    ``condition_id``, não por token id.
+
     Falhas devolvem ``None`` (caller deve dropar o sinal silenciosamente).
     """
 
-    def __init__(self, clob_url: str, http_session: aiohttp.ClientSession):
-        self._url = clob_url.rstrip("/")
+    def __init__(self, gamma_url: str, http_session: aiohttp.ClientSession):
+        self._url = gamma_url.rstrip("/")
         self._session = http_session
         self._cache: dict[str, tuple[str, str]] = {}
         self._lock = asyncio.Lock()
@@ -93,12 +119,13 @@ class MarketIdResolver:
 
         try:
             async with self._session.get(
-                f"{self._url}/markets/{token_id}"
+                f"{self._url}/markets",
+                params={"clob_token_ids": token_id},
             ) as resp:
                 if resp.status == 404:
                     return None
                 resp.raise_for_status()
-                data = await resp.json()
+                payload = await resp.json()
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             logger.warning(
                 "chain_watcher: market resolve falhou para token={} — {}",
@@ -106,13 +133,12 @@ class MarketIdResolver:
             )
             return None
 
-        market_id = data.get("condition_id") or data.get("conditionId")
-        outcome: str | None = None
-        for tok in data.get("tokens") or []:
-            if str(tok.get("token_id") or tok.get("tokenId") or "") == token_id:
-                outcome = (tok.get("outcome") or "").upper().strip()
-                break
-        if not market_id or outcome not in ("YES", "NO"):
+        if not isinstance(payload, list) or not payload:
+            return None
+        market = payload[0]
+        market_id = market.get("conditionId") or market.get("condition_id")
+        outcome = _extract_outcome_for_token(market, token_id)
+        if not market_id or not outcome:
             return None
 
         result = (str(market_id), outcome)
@@ -130,8 +156,8 @@ class _ParsedLog:
     block_number: int
     maker: str
     taker: str
-    maker_asset_id: int
-    taker_asset_id: int
+    side: int  # 0 = BUY, 1 = SELL — perspectiva do maker
+    token_id: int
     maker_amount: int
     taker_amount: int
 
@@ -284,16 +310,49 @@ class ChainWatcher:
             await self._sleep_or_stop(self._poll_interval)
 
     async def _scan_range(self, from_block: int, to_block: int) -> None:
-        """Quebra `[from, to]` em chunks ≤ `_MAX_LOG_RANGE` e processa cada log."""
+        """Quebra `[from, to]` em chunks ≤ `_MAX_LOG_RANGE` e processa cada log.
+
+        Adaptativo: se o RPC falha (timeout, "too many results", ...), divide o
+        chunk em dois e tenta cada metade. Bottom-out a chunks de 10 blocos —
+        abaixo disso, regista WARN e salta. Garante progresso mesmo em RPCs
+        públicos lentos sem perder cobertura quando voltam a responder.
+        """
         if from_block > to_block:
             return
         cursor = from_block
         while cursor <= to_block:
             chunk_end = min(cursor + _MAX_LOG_RANGE - 1, to_block)
-            logs = await self._eth_get_logs(cursor, chunk_end)
-            for raw in logs:
-                await self._handle_log(raw)
+            await self._scan_chunk_adaptive(cursor, chunk_end)
             cursor = chunk_end + 1
+
+    async def _scan_chunk_adaptive(
+        self, from_block: int, to_block: int, *, min_chunk: int = 10
+    ) -> None:
+        """Tenta `[from, to]`. Em caso de erro, divide e recursa até `min_chunk`."""
+        try:
+            logs = await self._eth_get_logs(from_block, to_block)
+        except Exception as exc:  # noqa: BLE001 — qualquer erro RPC: tentar dividir
+            span = to_block - from_block + 1
+            if span <= min_chunk:
+                logger.warning(
+                    "chain_watcher: chunk {}-{} falhou ({} blocos) — skip: {}",
+                    from_block, to_block, span, exc,
+                )
+                return
+            mid = from_block + span // 2 - 1
+            logger.debug(
+                "chain_watcher: chunk {}-{} falhou ({}); a dividir em "
+                "{}-{} e {}-{}",
+                from_block, to_block, exc, from_block, mid, mid + 1, to_block,
+            )
+            await self._scan_chunk_adaptive(from_block, mid, min_chunk=min_chunk)
+            await self._scan_chunk_adaptive(
+                mid + 1, to_block, min_chunk=min_chunk
+            )
+            return
+
+        for raw in logs:
+            await self._handle_log(raw)
 
     # ------------------------------------------------------------------ WS loop
     async def _ws_loop(self) -> None:
@@ -487,53 +546,40 @@ class ChainWatcher:
     def _resolve_followed(
         self, parsed: _ParsedLog
     ) -> tuple[str | None, TradeSide, str]:
-        """Devolve `(followed_addr, side, token_id)` ou `(None, _, _)` se nenhum
-        endereço seguido aparece no log.
+        """Devolve `(followed_addr, side, token_id)` ou `(None, _, _)` se a wallet
+        seguida não aparece como **maker** no log.
+
+        Só matchamos como maker, NUNCA como taker. Razão: numa trade Polymarket,
+        a tx batch dá origem a >=2 OrderFilled — uma para a ordem do utilizador
+        (wallet=maker, ``side`` directo, ``tokenId`` correcto) e outra para a
+        ordem da contraparte (wallet=taker, ``tokenId`` é o complementar YES↔NO,
+        side é o oposto). Match-as-taker emitiria sinal com lado e tokenId
+        invertidos. Como o operator de Polymarket emite sempre uma OrderFilled
+        com a wallet como maker para a ordem que ela assinou, a regra
+        "só maker" é completa e correcta.
 
         Comparação case-insensitive: `_followed_addresses` está em lowercase e
-        forçamos `.lower()` no maker/taker do log. Defensivo — `_decode_address_topic`
-        já lowercase, mas evita regressões se um path futuro injectar checksummed.
+        forçamos `.lower()` no maker do log.
         """
         maker = parsed.maker.lower()
-        taker = parsed.taker.lower()
-        if maker in self._followed_addresses:
-            side = (
-                TradeSide.BUY
-                if parsed.maker_asset_id == 0
-                else TradeSide.SELL
-            )
-            token_id = (
-                str(parsed.taker_asset_id)
-                if parsed.maker_asset_id == 0
-                else str(parsed.maker_asset_id)
-            )
-            return maker, side, token_id
-        if taker in self._followed_addresses:
-            side = (
-                TradeSide.BUY
-                if parsed.taker_asset_id == 0
-                else TradeSide.SELL
-            )
-            token_id = (
-                str(parsed.maker_asset_id)
-                if parsed.taker_asset_id == 0
-                else str(parsed.taker_asset_id)
-            )
-            return taker, side, token_id
-        return None, TradeSide.BUY, ""
+        if maker not in self._followed_addresses:
+            return None, TradeSide.BUY, ""
+        side = TradeSide.BUY if parsed.side == _SIDE_BUY else TradeSide.SELL
+        return maker, side, str(parsed.token_id)
 
     @staticmethod
     def _compute_price(parsed: _ParsedLog) -> Decimal | None:
-        """price = USDC amount / shares amount. USDC é o asset com id == 0."""
-        if parsed.maker_asset_id == 0:
-            usdc = parsed.maker_amount
-            shares = parsed.taker_amount
-        elif parsed.taker_asset_id == 0:
-            usdc = parsed.taker_amount
-            shares = parsed.maker_amount
+        """price = USDC amount / shares amount.
+
+        side=BUY (0): maker paga USDC pelas shares → makerAmount=USDC,
+            takerAmount=shares.
+        side=SELL (1): maker entrega shares por USDC → makerAmount=shares,
+            takerAmount=USDC.
+        """
+        if parsed.side == _SIDE_BUY:
+            usdc, shares = parsed.maker_amount, parsed.taker_amount
         else:
-            # Caso raro: nenhum dos lados é collateral (split/merge?) — drop.
-            return None
+            usdc, shares = parsed.taker_amount, parsed.maker_amount
         if shares <= 0:
             return None
         return Decimal(usdc) / Decimal(shares)
@@ -549,9 +595,17 @@ class ChainWatcher:
         maker = _decode_address_topic(topics[2])
         taker = _decode_address_topic(topics[3])
         data = raw.get("data") or "0x"
-        ints = _decode_uint256_array(data, count=5)
-        if ints is None:
+        # 7 slots: side(uint8), tokenId(uint256), makerAmount, takerAmount, fee,
+        # builder(bytes32), metadata(bytes32). Cada slot = 32 bytes; uint8 vai
+        # padded à esquerda. Fee/builder/metadata não são usados.
+        slots = _decode_uint256_array(data, count=7)
+        if slots is None:
             return None
+
+        side = slots[0]
+        token_id = slots[1]
+        maker_amount = slots[2]
+        taker_amount = slots[3]
 
         tx_hash = (raw.get("transactionHash") or "").lower()
         log_index = _to_int(raw.get("logIndex"), default=0)
@@ -563,10 +617,10 @@ class ChainWatcher:
             block_number=block_number,
             maker=maker,
             taker=taker,
-            maker_asset_id=ints[0],
-            taker_asset_id=ints[1],
-            maker_amount=ints[2],
-            taker_amount=ints[3],
+            side=side,
+            token_id=token_id,
+            maker_amount=maker_amount,
+            taker_amount=taker_amount,
         )
 
     # ------------------------------------------------------------------ JSON-RPC
@@ -615,6 +669,40 @@ class ChainWatcher:
 
 
 # --------------------------------------------------------------------- helpers
+def _extract_outcome_for_token(market: dict[str, Any], token_id: str) -> str | None:
+    """Mapeia ``token_id → outcome`` via os arrays paralelos da Gamma API.
+
+    ``outcomes`` e ``clobTokenIds`` podem vir como JSON-encoded strings ou listas
+    nativas. Devolve o nome do outcome em uppercase (ex.: ``"YES"``, ``"NO"``,
+    ``"FENERBAHCE"``) ou ``None`` se o token não bate ou os arrays estão mal
+    formados.
+    """
+    outcomes_raw = market.get("outcomes")
+    tokens_raw = market.get("clobTokenIds") or market.get("clob_token_ids")
+    outcomes = _parse_string_list(outcomes_raw)
+    tokens = _parse_string_list(tokens_raw)
+    if not outcomes or not tokens or len(outcomes) != len(tokens):
+        return None
+    for idx, tid in enumerate(tokens):
+        if str(tid).strip() == token_id:
+            name = outcomes[idx].strip()
+            return name.upper() if name else None
+    return None
+
+
+def _parse_string_list(raw: Any) -> list[str]:
+    """Aceita lista nativa ou JSON-encoded string (formato comum em Gamma)."""
+    if isinstance(raw, list):
+        return [str(x) for x in raw]
+    if isinstance(raw, str) and raw:
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+        return [str(x) for x in parsed] if isinstance(parsed, list) else []
+    return []
+
+
 def _decode_address_topic(topic: str) -> str:
     """topic é 0x + 64 hex chars; address são os últimos 40 chars (lowercase)."""
     s = topic.lower()

@@ -36,3 +36,7 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+
+# Claude Code runtime
+.claude/scheduled_tasks.lock
+.claude/worktrees/
