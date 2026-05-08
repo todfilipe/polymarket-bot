@@ -16,12 +16,15 @@ from polymarket_bot.monitoring.market_builder import (
 def _make_gamma_payload(
     market_id: str = "m1",
     clob_token_ids: str | list[str] | None = None,
+    outcomes: str | list[str] | None = None,
     end_date: str = "2026-05-10T00:00:00Z",
     volume: str = "150000",
     category: str = "Politics",
 ) -> dict:
     if clob_token_ids is None:
         clob_token_ids = '["tok-yes-111", "tok-no-222"]'
+    if outcomes is None:
+        outcomes = '["Yes", "No"]'
     return {
         "id": market_id,
         "slug": f"slug-{market_id}",
@@ -30,6 +33,7 @@ def _make_gamma_payload(
         "endDate": end_date,
         "volume": volume,
         "clobTokenIds": clob_token_ids,
+        "outcomes": outcomes,
     }
 
 
@@ -199,9 +203,52 @@ async def test_clob_token_ids_as_json_string_is_parsed():
 
 
 @pytest.mark.asyncio
-async def test_invalid_outcome_raises():
+async def test_outcome_not_in_market_raises():
+    """Outcome que não consta em ``outcomes`` deve levantar."""
+    gamma = _make_gamma_payload()  # outcomes=["Yes","No"]
+
+    async def fake_get(url: str, params=None):
+        if "/markets/" in url:
+            return gamma
+        return _make_book_payload()
+
     builder = MarketBuilder(gamma_url="http://g", clob_url="http://c")
-    with pytest.raises(MarketBuildError, match="outcome"):
+    _install_get_mock(builder, fake_get)
+
+    with pytest.raises(MarketBuildError, match="não consta"):
         await builder.build("m1", "MAYBE")
+
+
+@pytest.mark.asyncio
+async def test_negrisk_multi_outcome_resolves_correct_token():
+    """Mercado multi-outcome (Polymarket NegRisk) — match por nome.
+
+    Quatro outcomes distintos com clobTokenIds correspondentes; o builder
+    deve seleccionar o token na mesma posição que o nome do outcome.
+    """
+    gamma = _make_gamma_payload(
+        outcomes='["Fenerbahce", "Galatasaray", "Besiktas", "Trabzonspor"]',
+        clob_token_ids='["tk-fb", "tk-gs", "tk-bs", "tk-ts"]',
+    )
+
+    captured: list[dict] = []
+
+    async def fake_get(url: str, params=None):
+        if "/markets/" in url:
+            return gamma
+        captured.append(params or {})
+        return _make_book_payload()
+
+    builder = MarketBuilder(gamma_url="http://g", clob_url="http://c")
+    _install_get_mock(builder, fake_get)
+
+    snapshot = await builder.build("m1", "FENERBAHCE")
+    assert snapshot.outcome == "FENERBAHCE"
+    assert captured == [{"token_id": "tk-fb"}]
+
+    # Outro outcome → outro token, sem confusão.
+    snapshot2 = await builder.build("m1", "TRABZONSPOR")
+    assert snapshot2.outcome == "TRABZONSPOR"
+    assert captured[-1] == {"token_id": "tk-ts"}
 
 

@@ -85,12 +85,17 @@ class MarketBuilder:
     async def build(self, market_id: str, outcome: str) -> MarketSnapshot:
         """Devolve snapshot completo para `(market_id, outcome)`.
 
-        Lança `MarketBuildError` se o mercado não existe, o outcome é inválido,
-        ou o orderbook está vazio.
+        Lança `MarketBuildError` se o mercado não existe, o outcome não consta
+        na lista de outcomes do mercado, ou o orderbook está vazio.
+
+        Aceita binários (``"YES"``/``"NO"``) e NegRisk multi-outcome
+        (``"FENERBAHCE"``, ``"TEXAS RANGERS"``, ...). O matching com a Gamma
+        API é case-insensitive — basta que o outcome bata com algum dos
+        ``outcomes`` reportados pelo Gamma para esse mercado.
         """
-        outcome_up = outcome.upper()
-        if outcome_up not in ("YES", "NO"):
-            raise MarketBuildError(f"outcome inválido: {outcome!r}")
+        if not outcome or not outcome.strip():
+            raise MarketBuildError("outcome vazio")
+        outcome_up = outcome.strip().upper()
 
         key = (market_id, outcome_up)
         async with self._cache_lock:
@@ -171,39 +176,71 @@ class MarketBuilder:
             return await resp.json()
 
     # ------------------------------------------------------------------ parsing
-    @staticmethod
-    def _extract_token_id(market_raw: dict[str, Any], outcome: str) -> str:
-        raw = market_raw.get("clobTokenIds")
-        if raw is None:
-            raise MarketBuildError("campo `clobTokenIds` ausente na resposta Gamma")
+    @classmethod
+    def _extract_token_id(cls, market_raw: dict[str, Any], outcome: str) -> str:
+        """Encontra o ``token_id`` para um ``outcome`` no formato do Gamma.
 
-        token_ids: list[str]
-        if isinstance(raw, str):
-            try:
-                token_ids = json.loads(raw)
-            except json.JSONDecodeError as exc:
-                raise MarketBuildError(
-                    f"`clobTokenIds` não é JSON válido: {raw!r}"
-                ) from exc
-        elif isinstance(raw, list):
-            token_ids = list(raw)
-        else:
-            raise MarketBuildError(
-                f"`clobTokenIds` em formato inesperado: {type(raw).__name__}"
-            )
+        Para binários: ``outcomes=["Yes","No"]``, ``clobTokenIds=[t0,t1]``.
+        Para NegRisk multi-outcome: ``outcomes=["Fenerbahce","Galatasaray",...]``
+        com ``clobTokenIds`` na mesma ordem.
+
+        Match por nome case-insensitive contra a posição correspondente em
+        ``clobTokenIds``. Antes assumia binário com índice 0=YES/1=else, o que
+        falhava em mercados NegRisk multi-outcome.
+        """
+        token_ids = cls._parse_string_array(
+            market_raw.get("clobTokenIds"), field="clobTokenIds"
+        )
+        outcomes = cls._parse_string_array(
+            market_raw.get("outcomes"), field="outcomes"
+        )
 
         if len(token_ids) < 2:
             raise MarketBuildError(
                 f"`clobTokenIds` com menos de 2 entradas: {token_ids!r}"
             )
-
-        index = 0 if outcome == "YES" else 1
-        token_id = token_ids[index]
-        if not token_id:
+        if len(outcomes) != len(token_ids):
             raise MarketBuildError(
-                f"token_id vazio para outcome={outcome!r}"
+                f"`outcomes` ({len(outcomes)}) e `clobTokenIds` ({len(token_ids)}) "
+                f"com tamanhos diferentes"
             )
-        return str(token_id)
+
+        outcome_up = outcome.strip().upper()
+        for idx, name in enumerate(outcomes):
+            if name.strip().upper() == outcome_up:
+                token_id = token_ids[idx]
+                if not token_id:
+                    raise MarketBuildError(
+                        f"token_id vazio para outcome={outcome!r}"
+                    )
+                return str(token_id)
+
+        raise MarketBuildError(
+            f"outcome {outcome!r} não consta em outcomes={outcomes}"
+        )
+
+    @staticmethod
+    def _parse_string_array(raw: Any, *, field: str) -> list[str]:
+        """Aceita lista nativa ou JSON-encoded string (formato comum no Gamma)."""
+        if raw is None:
+            raise MarketBuildError(f"campo `{field}` ausente na resposta Gamma")
+        if isinstance(raw, list):
+            return [str(x) for x in raw]
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise MarketBuildError(
+                    f"`{field}` não é JSON válido: {raw!r}"
+                ) from exc
+            if not isinstance(parsed, list):
+                raise MarketBuildError(
+                    f"`{field}` JSON não é lista: {parsed!r}"
+                )
+            return [str(x) for x in parsed]
+        raise MarketBuildError(
+            f"`{field}` em formato inesperado: {type(raw).__name__}"
+        )
 
     @classmethod
     def _parse_orderbook(
