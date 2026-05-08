@@ -89,8 +89,21 @@ async def _score_one(
                 exc,
             )
             return None
+    # O leaderboard devolve EOAs (campo `user`), não proxy wallets.
+    # O proxy correto está em cada RawTrade.wallet_address (extraído de
+    # `proxyWallet` pelo _parse_trade). Usamos o do primeiro trade para
+    # garantir que o endereço guardado na DB bate com o maker/taker on-chain.
+    # Se não há trades, o wallet não passa o filtro mínimo de 50 trades de
+    # qualquer forma, por isso o fallback para EOA é inofensivo.
+    proxy_address = trades[0].wallet_address if trades else entry.wallet_address
+    if proxy_address != entry.wallet_address:
+        logger.debug(
+            "discovery: EOA {} → proxy {}",
+            entry.wallet_address,
+            proxy_address,
+        )
     return score_wallet(
-        entry.wallet_address,
+        proxy_address,
         trades,
         window_weeks=window_weeks,
         positions=positions,

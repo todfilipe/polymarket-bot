@@ -74,7 +74,8 @@
       "Bash(python -m pytest tests/unit/test_chain_watcher.py tests/unit/test_signal_reader.py -x -q)",
       "Bash(python -m pytest -q)",
       "Bash(python -m polymarket_bot.main --dry-run-check)",
-      "Bash(PYTHONPATH=src python -c \"from polymarket_bot.main import main; from polymarket_bot.monitoring.chain_watcher import ChainWatcher, MarketIdResolver; print\\('imports ok'\\)\")"
+      "Bash(PYTHONPATH=src python -c \"from polymarket_bot.main import main; from polymarket_bot.monitoring.chain_watcher import ChainWatcher, MarketIdResolver; print\\('imports ok'\\)\")",
+      "Bash(python -m pytest tests/unit/test_chain_watcher.py -v)"
     ]
   }
 }
