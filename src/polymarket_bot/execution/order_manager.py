@@ -36,10 +36,12 @@ from typing import Any
 from loguru import logger
 from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
 
+from sqlalchemy import select
+
 from polymarket_bot.config import Settings
 from polymarket_bot.config.constants import CONST
-from polymarket_bot.db.enums import BotTradeStatus, TradeSide
-from polymarket_bot.db.models import BotTrade
+from polymarket_bot.db.enums import BotTradeStatus, PositionStatus, TradeSide
+from polymarket_bot.db.models import BotTrade, Position
 from polymarket_bot.execution.dedup import is_duplicate, register_hash
 from polymarket_bot.market import MarketSnapshot
 
@@ -159,6 +161,20 @@ class OrderManager:
 
             if outcome_result.success:
                 await register_hash(session, dedup_hash)
+                # BUYs abrem ou crescem uma Position. SELLs aqui correspondem
+                # a fechos parciais/totais que o `ExitManager` regista
+                # separadamente — não criamos Position do lado da entrada.
+                if side == TradeSide.BUY:
+                    await self._upsert_open_position(
+                        session=session,
+                        market=market,
+                        outcome=outcome,
+                        side=side,
+                        size_usd=size_usd,
+                        executed_price=outcome_result.executed_price
+                            or intended_price,
+                        followed_wallet=followed_wallet,
+                    )
 
             await session.commit()
 
@@ -171,6 +187,76 @@ class OrderManager:
                 executed_price=outcome_result.executed_price,
                 bot_trade_id=trade.id,
             )
+
+    # ------------------------------------------------------------------
+    # Positions — abertura/incremento. Fechos vivem no `ExitManager`.
+    # ------------------------------------------------------------------
+    async def _upsert_open_position(
+        self,
+        *,
+        session: AsyncSession,
+        market: MarketSnapshot,
+        outcome: str,
+        side: TradeSide,
+        size_usd: Decimal,
+        executed_price: Decimal,
+        followed_wallet: str,
+    ) -> None:
+        """Cria ou cresce uma Position aberta para `(market, outcome, side)`.
+
+        Várias entradas no mesmo mercado durante a vida da posição agregam-se
+        em vez de criar linhas separadas — o ``avg_entry_price`` recalcula-se
+        ponderado por size. Permitimos `OPEN` e `PARTIALLY_CLOSED` como
+        candidatos a crescer (em ambos ainda há saldo aberto).
+        """
+        stmt = select(Position).where(
+            Position.market_id == market.market_id,
+            Position.outcome == outcome,
+            Position.side == side,
+            Position.is_paper.is_(not self.is_live),
+            Position.status.in_(
+                [PositionStatus.OPEN, PositionStatus.PARTIALLY_CLOSED]
+            ),
+        )
+        existing = (await session.execute(stmt)).scalar_one_or_none()
+        wallet_lower = followed_wallet.lower()
+
+        if existing is None:
+            position = Position(
+                market_id=market.market_id,
+                outcome=outcome,
+                side=side,
+                status=PositionStatus.OPEN,
+                is_paper=not self.is_live,
+                size_usd=size_usd,
+                avg_entry_price=executed_price,
+                entries_count=1,
+                opened_at=datetime.now(timezone.utc),
+                closed_at=None,
+                realized_pnl_usd=None,
+                followed_wallets=[wallet_lower],
+                token_id=market.token_id,
+            )
+            session.add(position)
+            return
+
+        # Incrementa size e recalcula avg_entry ponderado.
+        new_size = existing.size_usd + size_usd
+        if new_size > 0:
+            existing.avg_entry_price = (
+                existing.avg_entry_price * existing.size_usd
+                + executed_price * size_usd
+            ) / new_size
+        existing.size_usd = new_size
+        existing.entries_count = existing.entries_count + 1
+        if wallet_lower not in (existing.followed_wallets or []):
+            existing.followed_wallets = [
+                *(existing.followed_wallets or []),
+                wallet_lower,
+            ]
+        # Volta a OPEN se estava PARTIALLY_CLOSED — adicionámos size.
+        if existing.status == PositionStatus.PARTIALLY_CLOSED:
+            existing.status = PositionStatus.OPEN
 
     # ------------------------------------------------------------------
     # Rotas de submissão — separadas para clareza e testabilidade.

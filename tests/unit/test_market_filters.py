@@ -28,12 +28,13 @@ class TestMarketFilters:
         assert not result.passes
         assert any("volume" in r for r in result.reasons)
 
-    def test_too_soon_fails(self):
-        # 30 min até resolução — abaixo do MIN_HOURS_TO_RESOLUTION (1h actual).
+    def test_no_min_resolution_time_passes(self):
+        # MIN_HOURS_TO_RESOLUTION=0 → mesmo tempo curtíssimo passa o filtro.
         snap = make_snapshot(days_to_resolution=0.5 / 24)
         result = check_market_filters(snap)
-        assert not result.passes
-        assert any("tempo" in r and "mín" in r for r in result.reasons)
+        # Pode falhar por outra razão (ex.: zona ideal), mas não pelo
+        # tempo mínimo.
+        assert not any("mín" in r and "tempo" in r for r in result.reasons)
 
     def test_too_far_fails(self):
         snap = make_snapshot(days_to_resolution=90)

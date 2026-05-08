@@ -65,10 +65,9 @@ class StrategyConstants:
     # --- Filtros de mercado (§3.1) ---
     MIN_MARKET_VOLUME_USD: float = 50_000.0
     IDEAL_MARKET_VOLUME_USD: float = 100_000.0
-    # Mínimo de horas até resolução. CLAUDE.md §4 prevê 24h, mas muitos top
-    # traders entram em sports do próprio dia. Mantemos uma folga curta (1h)
-    # para evitar entrar mid-game, sem rejeitar pré-jogos.
-    MIN_HOURS_TO_RESOLUTION: int = 1
+    # Mínimo de horas até resolução. Sem mínimo (0h) por opção do utilizador
+    # — segue qualquer trade das wallets, incluindo last-minute.
+    MIN_HOURS_TO_RESOLUTION: int = 0
     MAX_DAYS_TO_RESOLUTION: int = 60
     MIN_IMPLIED_PROB: float = 0.10
     MAX_IMPLIED_PROB: float = 0.82
