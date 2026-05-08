@@ -162,7 +162,8 @@ async def main() -> None:
     chain_watcher: ChainWatcher | None = None
     if settings.signal_source in ("chain", "both"):
         market_resolver = MarketIdResolver(
-            clob_url=settings.clob_api_url, http_session=http_session
+            gamma_url=settings.polymarket_gamma_api_url,
+            http_session=http_session,
         )
 
         async def _on_chain_signal(sig):  # noqa: ANN001 — local closure

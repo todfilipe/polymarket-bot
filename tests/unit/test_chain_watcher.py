@@ -44,24 +44,32 @@ def _make_log(
     *,
     maker: str,
     taker: str,
-    maker_asset_id: int,
-    taker_asset_id: int,
+    side: int = 0,  # 0=BUY (maker compra tokens), 1=SELL (maker vende tokens)
+    token_id: int = 12345,
     maker_amount: int,
     taker_amount: int,
     fee: int = 0,
+    builder: int = 0,
+    metadata: int = 0,
     tx_hash: str = "0xabc123",
     log_index: int = 0,
     block_number: int = 1000,
     address: str = POLYMARKET_CTF_EXCHANGE,
     topic_override: str | None = None,
 ) -> dict:
-    """Constrói um log RPC bruto compatível com `eth_getLogs` / `eth_subscribe`."""
+    """Constrói um log RPC bruto compatível com `eth_getLogs` / `eth_subscribe`.
+
+    Data layout (V2 contract): 7 slots de 32 bytes — side(uint8 padded), tokenId,
+    makerAmount, takerAmount, fee, builder(bytes32), metadata(bytes32).
+    """
     data_hex = "0x" + (
-        _uint256(maker_asset_id)
-        + _uint256(taker_asset_id)
+        _uint256(side)
+        + _uint256(token_id)
         + _uint256(maker_amount)
         + _uint256(taker_amount)
         + _uint256(fee)
+        + _uint256(builder)
+        + _uint256(metadata)
     )
     return {
         "address": address.lower(),
@@ -133,7 +141,7 @@ def test_parse_log_extracts_all_fields():
     taker = "0x2222222222222222222222222222222222222222"
     raw = _make_log(
         maker=maker, taker=taker,
-        maker_asset_id=0, taker_asset_id=999,
+        side=0, token_id=999,
         maker_amount=400, taker_amount=1000,
         tx_hash="0xdeadbeef", log_index=3, block_number=42,
     )
@@ -141,8 +149,8 @@ def test_parse_log_extracts_all_fields():
     assert parsed is not None
     assert parsed.maker == maker.lower()
     assert parsed.taker == taker.lower()
-    assert parsed.maker_asset_id == 0
-    assert parsed.taker_asset_id == 999
+    assert parsed.side == 0
+    assert parsed.token_id == 999
     assert parsed.maker_amount == 400
     assert parsed.taker_amount == 1000
     assert parsed.tx_hash == "0xdeadbeef"
@@ -153,7 +161,7 @@ def test_parse_log_extracts_all_fields():
 def test_parse_log_returns_none_for_other_event_topic():
     raw = _make_log(
         maker="0xa", taker="0xb",
-        maker_asset_id=0, taker_asset_id=1, maker_amount=1, taker_amount=1,
+        side=0, token_id=1, maker_amount=1, taker_amount=1,
         topic_override="0x" + "0" * 64,
     )
     assert ChainWatcher._parse_log(raw) is None
@@ -181,7 +189,7 @@ async def test_handle_log_skips_when_neither_party_followed():
     log = _make_log(
         maker="0x1111111111111111111111111111111111111111",
         taker="0x2222222222222222222222222222222222222222",
-        maker_asset_id=0, taker_asset_id=12345,
+        side=0, token_id=12345,
         maker_amount=100, taker_amount=200,
     )
     await watcher._handle_log(log)
@@ -201,10 +209,10 @@ async def test_handle_log_emits_signal_when_maker_followed():
     other = "0xbbbb000000000000000000000000000000000000"
     watcher = _make_watcher([_wallet(followed)], callback=cb)
 
-    # Maker = followed, makerAsset=0 (USDC) → BUY de tokens
+    # Maker = followed, side=0 (BUY) → maker compra tokens, paga makerAmount em USDC
     log = _make_log(
         maker=followed, taker=other,
-        maker_asset_id=0, taker_asset_id=999,
+        side=0, token_id=999,
         maker_amount=400_000, taker_amount=1_000_000,
         tx_hash="0xfeedbeef",
     )
@@ -224,7 +232,7 @@ async def test_handle_log_emits_signal_when_maker_followed():
 
 
 @pytest.mark.asyncio
-async def test_maker_followed_with_token_makerasset_is_sell():
+async def test_maker_followed_with_side_sell_is_sell():
     captured: list[DetectedSignal] = []
 
     async def cb(s):
@@ -233,21 +241,25 @@ async def test_maker_followed_with_token_makerasset_is_sell():
     followed = "0xaaaa000000000000000000000000000000000000"
     watcher = _make_watcher([_wallet(followed)], callback=cb)
 
-    # Maker = followed, makerAsset=token (não-zero) → maker está a vender
+    # Maker = followed, side=1 (SELL) → maker entrega shares, recebe USDC
     log = _make_log(
         maker=followed,
         taker="0xbbbb000000000000000000000000000000000000",
-        maker_asset_id=42, taker_asset_id=0,
+        side=1, token_id=42,
         maker_amount=1_000_000, taker_amount=600_000,
     )
     await watcher._handle_log(log)
     assert captured[0].side == TradeSide.SELL
-    # price = USDC / shares = 600_000 / 1_000_000 = 0.6
+    # SELL: makerAmount=shares, takerAmount=USDC → price = USDC/shares = 600/1000 = 0.6
     assert captured[0].price == Decimal("600000") / Decimal("1000000")
 
 
 @pytest.mark.asyncio
-async def test_taker_followed_with_usdc_takerasset_is_buy():
+async def test_taker_followed_does_not_emit_signal():
+    """Quando a wallet seguida aparece como TAKER (não maker), o ChainWatcher
+    descarta o log: numa tx batched o tokenId do taker é o complementar YES↔NO,
+    pelo que emitir sinal daria lado e mercado invertidos.
+    """
     captured: list[DetectedSignal] = []
 
     async def cb(s):
@@ -256,35 +268,17 @@ async def test_taker_followed_with_usdc_takerasset_is_buy():
     followed = "0xaaaa000000000000000000000000000000000000"
     watcher = _make_watcher([_wallet(followed)], callback=cb)
 
+    # Maker é outro endereço — wallet seguida só aparece como taker.
     log = _make_log(
         maker="0xbbbb000000000000000000000000000000000000",
         taker=followed,
-        maker_asset_id=42, taker_asset_id=0,
+        side=1, token_id=42,
         maker_amount=1_000_000, taker_amount=600_000,
     )
     await watcher._handle_log(log)
-    # Taker deu USDC (takerAsset=0) → taker está a comprar
-    assert captured[0].side == TradeSide.BUY
-
-
-@pytest.mark.asyncio
-async def test_taker_followed_with_token_takerasset_is_sell():
-    captured: list[DetectedSignal] = []
-
-    async def cb(s):
-        captured.append(s)
-
-    followed = "0xaaaa000000000000000000000000000000000000"
-    watcher = _make_watcher([_wallet(followed)], callback=cb)
-
-    log = _make_log(
-        maker="0xbbbb000000000000000000000000000000000000",
-        taker=followed,
-        maker_asset_id=0, taker_asset_id=42,
-        maker_amount=400_000, taker_amount=1_000_000,
-    )
-    await watcher._handle_log(log)
-    assert captured[0].side == TradeSide.SELL
+    assert captured == []
+    # Também não deve marcar como visto — mantém o set limpo.
+    assert watcher._seen_logs == set()
 
 
 # --------------------------------------------------------------- dedup
@@ -303,7 +297,7 @@ async def test_duplicate_log_not_emitted_twice():
     log = _make_log(
         maker=followed,
         taker="0xbbbb000000000000000000000000000000000000",
-        maker_asset_id=0, taker_asset_id=999,
+        side=0, token_id=999,
         maker_amount=400, taker_amount=1000,
         tx_hash="0xdup", log_index=0,
     )
@@ -330,7 +324,7 @@ async def test_signal_dropped_when_resolver_returns_none():
     log = _make_log(
         maker=followed,
         taker="0xbbbb000000000000000000000000000000000000",
-        maker_asset_id=0, taker_asset_id=999,
+        side=0, token_id=999,
         maker_amount=400, taker_amount=1000,
     )
     await watcher._handle_log(log)
