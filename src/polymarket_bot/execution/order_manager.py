@@ -202,13 +202,21 @@ class OrderManager:
         executed_price: Decimal,
         followed_wallet: str,
     ) -> None:
-        """Cria ou cresce uma Position aberta para `(market, outcome, side)`.
+        """Cria ou cresce uma Position **per-wallet** para
+        ``(wallet, market, outcome, side)``.
 
-        Várias entradas no mesmo mercado durante a vida da posição agregam-se
-        em vez de criar linhas separadas — o ``avg_entry_price`` recalcula-se
-        ponderado por size. Permitimos `OPEN` e `PARTIALLY_CLOSED` como
-        candidatos a crescer (em ambos ainda há saldo aberto).
+        Cada wallet seguida tem a sua própria position no mesmo mercado —
+        permite que exits e take-profits sejam atribuídos correctamente à
+        wallet de origem. Se 7 wallets compram o mesmo outcome, ficam 7
+        positions independentes (e o `ExposureGuard` agrega ao nível do evento
+        para verificar limites).
+
+        Re-entradas da MESMA wallet no mesmo mercado agregam-se: avg_entry
+        recalcula-se ponderado por size, entries_count incrementa. Wallets
+        diferentes nunca são misturadas.
         """
+        wallet_lower = followed_wallet.lower()
+
         stmt = select(Position).where(
             Position.market_id == market.market_id,
             Position.outcome == outcome,
@@ -218,8 +226,14 @@ class OrderManager:
                 [PositionStatus.OPEN, PositionStatus.PARTIALLY_CLOSED]
             ),
         )
-        existing = (await session.execute(stmt)).scalar_one_or_none()
-        wallet_lower = followed_wallet.lower()
+        candidates = (await session.execute(stmt)).scalars().all()
+        existing = next(
+            (
+                p for p in candidates
+                if wallet_lower in {a.lower() for a in (p.followed_wallets or [])}
+            ),
+            None,
+        )
 
         if existing is None:
             position = Position(
@@ -240,7 +254,7 @@ class OrderManager:
             session.add(position)
             return
 
-        # Incrementa size e recalcula avg_entry ponderado.
+        # Mesma wallet, re-entrada no mesmo mercado → agrega.
         new_size = existing.size_usd + size_usd
         if new_size > 0:
             existing.avg_entry_price = (
@@ -249,12 +263,6 @@ class OrderManager:
             ) / new_size
         existing.size_usd = new_size
         existing.entries_count = existing.entries_count + 1
-        if wallet_lower not in (existing.followed_wallets or []):
-            existing.followed_wallets = [
-                *(existing.followed_wallets or []),
-                wallet_lower,
-            ]
-        # Volta a OPEN se estava PARTIALLY_CLOSED — adicionámos size.
         if existing.status == PositionStatus.PARTIALLY_CLOSED:
             existing.status = PositionStatus.OPEN
 

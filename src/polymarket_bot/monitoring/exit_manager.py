@@ -57,7 +57,6 @@ class LiveExitError(Exception):
 HARD_STOP_LOSS_RATIO = Decimal(str(CONST.HARD_STOP_LOSS_PER_POSITION))
 TAKE_PROFIT_TRIGGER = Decimal(str(CONST.TAKE_PROFIT_PROFIT_TRIGGER))
 TAKE_PROFIT_CLOSE_FRACTION = Decimal(str(CONST.TAKE_PROFIT_CLOSE_FRACTION))
-MIN_WALLET_TIMING_SKILL = float(CONST.MIN_WALLET_TIMING_SKILL)
 
 _NOTE_PARTIAL_TAKEN = "partial_taken"
 _NOTE_EXIT_PENDING_MANUAL = "exit_pending_manual"
@@ -197,22 +196,20 @@ class ExitManager:
                 position, current_price
             )
 
-        # 4) Wallet exit — só se a wallet tem histórico consistente.
+        # 4) Wallet exit — segue sempre que a wallet que originou esta position
+        # vende. Como cada Position é per-wallet (upsert scoped por wallet em
+        # `OrderManager._upsert_open_position`), `_detect_wallet_exits` só
+        # devolve a wallet desta position. Sem threshold de skill: confiamos
+        # na wallet para a entrada, confiamos para a saída (copytrade puro).
         candidates = await self._detect_wallet_exits(position)
         for c in candidates:
-            if c.timing_skill_ratio > MIN_WALLET_TIMING_SKILL:
-                log.bind(
-                    exit_reason=ExitReason.WALLET_EXIT.value,
-                    wallet=c.wallet_address,
-                    timing_skill=c.timing_skill_ratio,
-                ).info("exit: wallet seguida vendeu (skill suficiente)")
-                return await self._close_full(
-                    position, ExitReason.WALLET_EXIT, current_price, pnl_usd
-                )
-            else:
-                log.bind(wallet=c.wallet_address, timing_skill=c.timing_skill_ratio).info(
-                    "exit: wallet vendeu mas skill insuficiente — ignorar"
-                )
+            log.bind(
+                exit_reason=ExitReason.WALLET_EXIT.value,
+                wallet=c.wallet_address,
+            ).info("exit: wallet seguida vendeu — a fechar")
+            return await self._close_full(
+                position, ExitReason.WALLET_EXIT, current_price, pnl_usd
+            )
 
         return _skipped(position, self._live_mode, "sem condição de saída")
 

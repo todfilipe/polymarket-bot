@@ -114,6 +114,53 @@ class TestOrderManagerDryRun:
         assert hashes[0].hash_key == kwargs["dedup_hash"]
 
     @pytest.mark.asyncio
+    async def test_position_per_wallet_does_not_aggregate_distinct_wallets(
+        self, sessionmaker
+    ):
+        """Duas wallets diferentes no mesmo (market, outcome) → 2 Positions
+        separadas. Permite atribuição de exits a wallet de origem."""
+        from polymarket_bot.db.models import Position
+
+        om = OrderManager(_make_settings(live_mode=False), sessionmaker)
+
+        first_kwargs = _submit_kwargs(dedup_hash="hash_wallet_a")
+        first_kwargs["followed_wallet"] = "0xWalletA"
+        await om.submit(**first_kwargs)
+
+        second_kwargs = _submit_kwargs(dedup_hash="hash_wallet_b")
+        second_kwargs["followed_wallet"] = "0xWalletB"
+        await om.submit(**second_kwargs)
+
+        async with sessionmaker() as s:
+            positions = (await s.execute(select(Position))).scalars().all()
+        assert len(positions) == 2
+        wallets_per_position = [
+            set((p.followed_wallets or [])) for p in positions
+        ]
+        assert {"0xwalleta"} in wallets_per_position
+        assert {"0xwalletb"} in wallets_per_position
+
+    @pytest.mark.asyncio
+    async def test_position_per_wallet_aggregates_same_wallet_reentries(
+        self, sessionmaker
+    ):
+        """Mesma wallet a re-entrar no mesmo mercado → agrega na mesma Position
+        (size soma, avg_entry ponderado)."""
+        from polymarket_bot.db.models import Position
+
+        om = OrderManager(_make_settings(live_mode=False), sessionmaker)
+
+        first = _submit_kwargs(dedup_hash="hash_first")
+        await om.submit(**first)
+        second = _submit_kwargs(dedup_hash="hash_second")
+        await om.submit(**second)
+
+        async with sessionmaker() as s:
+            positions = (await s.execute(select(Position))).scalars().all()
+        assert len(positions) == 1
+        assert positions[0].entries_count == 2
+
+    @pytest.mark.asyncio
     async def test_dedup_prevents_second_submission(self, sessionmaker):
         om = OrderManager(_make_settings(live_mode=False), sessionmaker)
         kwargs = _submit_kwargs()

@@ -308,9 +308,12 @@ async def test_wallet_exit_when_timing_skill_above_threshold(sessionmaker, monke
 
 
 @pytest.mark.asyncio
-async def test_wallet_exit_ignored_when_timing_skill_below_threshold(
+async def test_wallet_exit_follows_regardless_of_timing_skill(
     sessionmaker, monkeypatch
 ):
+    """No modo copytrade puro, qualquer wallet exit dispara o fecho —
+    o threshold de timing_skill_ratio foi removido. Confiamos na wallet
+    para sair tal como confiámos para entrar."""
     await _seed_open_position(
         sessionmaker,
         size_usd="100",
@@ -321,14 +324,14 @@ async def test_wallet_exit_ignored_when_timing_skill_below_threshold(
     manager = _make_exit_manager(sessionmaker, snapshot=snap)
 
     async def _detect(position):
-        return [WalletExitCandidate(wallet_address="0xabc", timing_skill_ratio=0.50)]
+        # Skill baixo (0.30) — antes seria ignorado; agora segue.
+        return [WalletExitCandidate(wallet_address="0xabc", timing_skill_ratio=0.30)]
 
     monkeypatch.setattr(manager, "_detect_wallet_exits", _detect)
 
     [result] = await manager.check_all_positions()
 
-    assert result.skipped is True
-    assert result.exit_reason is None
+    assert result.exit_reason == ExitReason.WALLET_EXIT
 
 
 @pytest.mark.asyncio
