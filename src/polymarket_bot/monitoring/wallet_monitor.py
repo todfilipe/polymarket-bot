@@ -160,6 +160,8 @@ class WalletMonitor:
         finally:
             await self._stop_chain_watcher()
 
+        logger.info("wallet_monitor: parado")
+
     @staticmethod
     def _write_heartbeat() -> None:
         try:
@@ -168,8 +170,6 @@ class WalletMonitor:
             path.write_text(datetime.now(timezone.utc).isoformat())
         except Exception:  # noqa: BLE001 — heartbeat não pode partir o bot
             pass
-
-        logger.info("wallet_monitor: parado")
 
     def stop(self) -> None:
         self._stop_event.set()

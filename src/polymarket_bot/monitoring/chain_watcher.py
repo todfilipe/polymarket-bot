@@ -328,10 +328,22 @@ class ChainWatcher:
     async def _scan_chunk_adaptive(
         self, from_block: int, to_block: int, *, min_chunk: int = 10
     ) -> None:
-        """Tenta `[from, to]`. Em caso de erro, divide e recursa até `min_chunk`."""
+        """Tenta `[from, to]`. Em caso de erro, divide e recursa até `min_chunk`.
+
+        Excepção: erros de **rate limit** (429) NÃO são retried por halving —
+        retentar mais rápido só piora. Logamos e voltamos; o próximo poll
+        round vai apanhar este range com cursor preservado pelo caller.
+        """
         try:
             logs = await self._eth_get_logs(from_block, to_block)
         except Exception as exc:  # noqa: BLE001 — qualquer erro RPC: tentar dividir
+            msg = str(exc).lower()
+            if "429" in msg or "too many requests" in msg or "rate" in msg:
+                logger.warning(
+                    "chain_watcher: rate-limited em {}-{} — não retentar agora "
+                    "(próximo poll apanha)", from_block, to_block,
+                )
+                return
             span = to_block - from_block + 1
             if span <= min_chunk:
                 logger.warning(
