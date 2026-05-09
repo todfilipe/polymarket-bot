@@ -291,7 +291,14 @@ class ChainWatcher:
                 self._poll_interval,
             )
 
+        # Backoff dinâmico em 429: cada poll round que hit rate-limit duplica
+        # o sleep até a um máximo (60s); rounds OK reset para o `_poll_interval`
+        # base. Evita martelar provider em rate-limit constante.
+        sleep_for = self._poll_interval
+        max_sleep = 60
+
         while not self._stop.is_set():
+            hit_rate_limit = False
             try:
                 latest = await self._eth_block_number()
                 start = (
@@ -305,9 +312,21 @@ class ChainWatcher:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
-                logger.warning("chain_watcher: poll round falhou — {}", exc)
+                msg = str(exc).lower()
+                if "429" in msg or "too many requests" in msg or "rate" in msg:
+                    hit_rate_limit = True
+                    logger.warning(
+                        "chain_watcher: rate-limited no poll round — backoff "
+                        "para {}s", min(sleep_for * 2, max_sleep),
+                    )
+                else:
+                    logger.warning("chain_watcher: poll round falhou — {}", exc)
 
-            await self._sleep_or_stop(self._poll_interval)
+            if hit_rate_limit:
+                sleep_for = min(sleep_for * 2, max_sleep)
+            else:
+                sleep_for = self._poll_interval  # reset
+            await self._sleep_or_stop(sleep_for)
 
     async def _scan_range(self, from_block: int, to_block: int) -> None:
         """Quebra `[from, to]` em chunks ≤ `_MAX_LOG_RANGE` e processa cada log.
