@@ -199,11 +199,13 @@ async def test_pnl_at_minus_39pct_does_not_exit(sessionmaker):
 
 
 @pytest.mark.asyncio
-async def test_take_profit_partial_closes_half_on_price_75(sessionmaker):
+async def test_take_profit_partial_closes_half_on_50pct_gain(sessionmaker):
+    """Trigger por LUCRO ≥ +50%, não por preço absoluto. Entry 0.40,
+    current 0.80 → +100% gain → bem acima do trigger."""
     pos = await _seed_open_position(
         sessionmaker, size_usd="100", avg_entry_price="0.40"
     )
-    snap = _snapshot(mid_price="0.80")  # ≥ 0.75
+    snap = _snapshot(mid_price="0.80")  # +100% gain
     manager = _make_exit_manager(sessionmaker, snapshot=snap)
 
     [result] = await manager.check_all_positions()
@@ -237,8 +239,26 @@ async def test_take_profit_does_not_repeat_when_partial_already_taken(sessionmak
 
 
 @pytest.mark.asyncio
-async def test_temporal_exit_when_hours_under_6_and_in_profit(sessionmaker):
-    # avg_entry=0.40, current=0.45 → em lucro.
+async def test_high_entry_price_no_movement_does_not_trigger_partial(sessionmaker):
+    """Bug fix: entrar a 0.77 e o preço continuar a 0.77 não deve disparar
+    partial (lucro = 0%). Antes disparava porque o trigger era preço ≥ 0.75."""
+    await _seed_open_position(
+        sessionmaker, size_usd="100", avg_entry_price="0.77"
+    )
+    snap = _snapshot(mid_price="0.77")
+    manager = _make_exit_manager(sessionmaker, snapshot=snap)
+
+    [result] = await manager.check_all_positions()
+
+    assert result.skipped is True
+    assert result.exit_reason is None
+
+
+@pytest.mark.asyncio
+async def test_small_profit_does_not_trigger_partial(sessionmaker):
+    """Lucro <50% (mesmo perto da resolução) deixa correr — temporal exit
+    foi removido em favor de hold-to-resolution."""
+    # entry=0.40, current=0.45 → +12.5% lucro (abaixo do trigger +50%)
     await _seed_open_position(
         sessionmaker, size_usd="100", avg_entry_price="0.40"
     )
@@ -247,13 +267,13 @@ async def test_temporal_exit_when_hours_under_6_and_in_profit(sessionmaker):
 
     [result] = await manager.check_all_positions()
 
-    assert result.exit_reason == ExitReason.TEMPORAL_EXIT
-    assert result.pnl_usd > 0
+    assert result.skipped is True
+    assert result.exit_reason is None
 
 
 @pytest.mark.asyncio
-async def test_temporal_exit_skipped_when_in_loss(sessionmaker):
-    # avg_entry=0.50, current=0.45 → em perda (mas < -40%, logo não é SL).
+async def test_in_loss_with_short_resolution_does_not_exit(sessionmaker):
+    """Em perda perto da resolução já não é fechada (era TEMPORAL_EXIT)."""
     await _seed_open_position(
         sessionmaker, size_usd="100", avg_entry_price="0.50"
     )

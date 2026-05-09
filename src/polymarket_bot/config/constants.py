@@ -86,12 +86,14 @@ class StrategyConstants:
     HIGH_VOLUME_THRESHOLD: float = 500_000.0
     ORDER_EXECUTION_WINDOW_SECONDS: int = 60
 
-    # --- Saídas (§6.1) ---
+    # --- Saídas ---
     HARD_STOP_LOSS_PER_POSITION: float = -0.40
-    TAKE_PROFIT_PROBABILITY: float = 0.75
-    TAKE_PROFIT_CLOSE_FRACTION: float = 0.50
+    # Take profit parcial: dispara com base no LUCRO REALIZÁVEL, não no preço
+    # absoluto. Antes era "preço ≥ 0.75" o que disparava trades a acabar
+    # logo na entrada quando se entrava ≥ 0.75. Agora exige movimento real.
+    TAKE_PROFIT_PROFIT_TRIGGER: float = 0.50      # +50% de paper gain
+    TAKE_PROFIT_CLOSE_FRACTION: float = 0.50      # fecha 50% da posição
     MIN_WALLET_TIMING_SKILL: float = 0.60
-    EARLY_EXIT_HOURS: int = 6             # resolve em < 6h
 
     # --- Adições (§5.1) ---
     MOMENTUM_ADD_FRACTION: float = 0.50

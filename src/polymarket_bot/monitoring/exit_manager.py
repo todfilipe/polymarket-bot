@@ -55,10 +55,9 @@ class LiveExitError(Exception):
     """
 
 HARD_STOP_LOSS_RATIO = Decimal(str(CONST.HARD_STOP_LOSS_PER_POSITION))
-TAKE_PROFIT_PROBABILITY = Decimal(str(CONST.TAKE_PROFIT_PROBABILITY))
+TAKE_PROFIT_TRIGGER = Decimal(str(CONST.TAKE_PROFIT_PROFIT_TRIGGER))
 TAKE_PROFIT_CLOSE_FRACTION = Decimal(str(CONST.TAKE_PROFIT_CLOSE_FRACTION))
 MIN_WALLET_TIMING_SKILL = float(CONST.MIN_WALLET_TIMING_SKILL)
-EARLY_EXIT_HOURS = CONST.EARLY_EXIT_HOURS
 
 _NOTE_PARTIAL_TAKEN = "partial_taken"
 _NOTE_EXIT_PENDING_MANUAL = "exit_pending_manual"
@@ -67,7 +66,6 @@ _NOTE_EXIT_PENDING_MANUAL = "exit_pending_manual"
 class ExitReason(StrEnum):
     HARD_STOP_LOSS = "HARD_STOP_LOSS"
     TAKE_PROFIT_PARTIAL = "TAKE_PROFIT_PARTIAL"
-    TEMPORAL_EXIT = "TEMPORAL_EXIT"
     WALLET_EXIT = "WALLET_EXIT"
 
 
@@ -182,30 +180,21 @@ class ExitManager:
                 await self._after_stop_loss(pnl_ratio)
             return result
 
-        # 2) Take profit parcial — 1× por posição.
+        # 2) Take profit parcial — dispara quando o lucro REALIZÁVEL atinge o
+        # threshold (default +50%). Vende 50%, ficando-se com upside na metade
+        # restante (que continua sob hard stop loss e wallet exit).
+        # Apenas 1× por posição (`_NOTE_PARTIAL_TAKEN`).
         if (
-            current_price >= TAKE_PROFIT_PROBABILITY
+            pnl_ratio >= TAKE_PROFIT_TRIGGER
             and position.entries_count == 1
             and position.notes != _NOTE_PARTIAL_TAKEN
         ):
-            log.bind(exit_reason=ExitReason.TAKE_PROFIT_PARTIAL.value).info(
-                "exit: take profit parcial"
-            )
+            log.bind(
+                exit_reason=ExitReason.TAKE_PROFIT_PARTIAL.value,
+                pnl_ratio=f"{float(pnl_ratio):.3f}",
+            ).info("exit: take profit parcial (+{:.0%})", float(pnl_ratio))
             return await self._close_partial(
                 position, current_price
-            )
-
-        # 3) Saída temporal.
-        if (
-            snapshot.hours_to_resolution < EARLY_EXIT_HOURS
-            and current_value > position.size_usd
-        ):
-            log.bind(
-                exit_reason=ExitReason.TEMPORAL_EXIT.value,
-                hours_to_resolution=snapshot.hours_to_resolution,
-            ).info("exit: saída temporal (resolve em breve e em lucro)")
-            return await self._close_full(
-                position, ExitReason.TEMPORAL_EXIT, current_price, pnl_usd
             )
 
         # 4) Wallet exit — só se a wallet tem histórico consistente.
