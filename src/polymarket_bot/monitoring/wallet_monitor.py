@@ -24,6 +24,7 @@ import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 from typing import Awaitable, Callable
 
 from loguru import logger
@@ -146,6 +147,10 @@ class WalletMonitor:
                     )
                     raise
 
+                # Heartbeat para o dashboard — mostra "online há Xs". Best-effort,
+                # qualquer erro de I/O é silenciado para não derrubar o tick.
+                self._write_heartbeat()
+
                 try:
                     await asyncio.wait_for(
                         self._stop_event.wait(), timeout=self._poll_interval
@@ -154,6 +159,15 @@ class WalletMonitor:
                     continue
         finally:
             await self._stop_chain_watcher()
+
+    @staticmethod
+    def _write_heartbeat() -> None:
+        try:
+            path = Path("dashboard/heartbeat.txt")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(datetime.now(timezone.utc).isoformat())
+        except Exception:  # noqa: BLE001 — heartbeat não pode partir o bot
+            pass
 
         logger.info("wallet_monitor: parado")
 

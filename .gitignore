@@ -40,3 +40,6 @@ Thumbs.db
 # Claude Code runtime
 .claude/scheduled_tasks.lock
 .claude/worktrees/
+
+# Dashboard runtime
+dashboard/heartbeat.txt
