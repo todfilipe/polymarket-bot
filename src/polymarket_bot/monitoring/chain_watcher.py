@@ -77,11 +77,13 @@ _REPLAY_BLOCKS = 200
 _HTTP_POLL_INTERVAL_SECONDS = 15
 _WS_RECONNECT_INITIAL_DELAY = 1.0
 _WS_RECONNECT_MAX_DELAY = 60.0
-# eth_getLogs em RPCs públicos: Polymarket emite ~150 OrderFilled/bloco no V2.
-# 500 blocos → ~75k logs → timeout em endpoints públicos. 100 blocos → ~15k,
-# manejável. Providers privados (Alchemy/Infura) suportam mais, mas mantemos
-# 100 como default seguro.
-_MAX_LOG_RANGE = 100
+# eth_getLogs: Alchemy free tier impõe um cap de 10 blocos por chamada
+# (mensagem explícita: "Under the Free tier plan, you can make eth_getLogs
+# requests with up to a 10 block range"). 10 é o default seguro que funciona
+# em todos os providers free. Em paid tiers (Alchemy Growth+, Infura paid,
+# QuickNode) suportam ranges de centenas/milhares — pode-se aumentar via
+# variável de ambiente se quiseres reduzir requests.
+_MAX_LOG_RANGE = 10
 
 
 SignalCallback = Callable[[DetectedSignal], Awaitable[None]]
