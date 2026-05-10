@@ -149,13 +149,23 @@ class MarketBuilder:
         ``market_id`` aceita formato bytes32 (``conditionId`` 0x...) ou o id
         numérico interno do Gamma. O endpoint path ``/markets/{id}`` só aceita
         o id numérico — para ``conditionId`` usa-se o query ``?condition_ids=``
-        que devolve uma lista. Tentamos a query primeiro (cobre os dois casos
-        em produção, já que `chain_watcher` passa o ``conditionId``); só se
-        falhar caímos no path.
+        que devolve uma lista.
+
+        Para ``conditionId``, tentamos primeiro a query default (markets activos)
+        e, se vier vazio, tentamos com ``closed=true`` para apanhar mercados
+        já resolvidos. Sem este fallback, o ``ExitManager`` não consegue detectar
+        resolução e as posições ficam open para sempre.
         """
         if str(market_id).lower().startswith("0x"):
             url = f"{self._gamma_url}/markets"
             payload = await self._get(url, params={"condition_ids": market_id})
+            if not isinstance(payload, list) or not payload:
+                # Fallback: mercado pode estar resolvido — Gamma filtra por
+                # default. Pede explicitamente os fechados.
+                payload = await self._get(
+                    url,
+                    params={"condition_ids": market_id, "closed": "true"},
+                )
             if not isinstance(payload, list) or not payload:
                 raise MarketBuildError(
                     f"market não encontrado em Gamma para condition_id={market_id!r}"
