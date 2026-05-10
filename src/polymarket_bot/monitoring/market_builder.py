@@ -194,6 +194,40 @@ class MarketBuilder:
             resp.raise_for_status()
             return await resp.json()
 
+    async def get_resolution_status(
+        self, market_id: str
+    ) -> tuple[bool, str | None]:
+        """Verifica se o mercado já resolveu via Gamma.
+
+        Heurística: ``outcomePrices`` com um dos preços ≥ 0.999 → resolvido,
+        e esse outcome é o vencedor. Funciona para binários (Yes/No → 1/0)
+        e NegRisk multi-outcome (1 vencedor, restantes 0).
+
+        Devolve ``(is_resolved, winning_outcome_uppercase)``. Se não resolveu
+        ainda ou se a resposta da Gamma é inesperada, devolve ``(False, None)``.
+        """
+        try:
+            market = await self._fetch_market(market_id)
+        except (MarketBuildError, _TransientMarketError):
+            return False, None
+        outcomes = self._parse_string_array(
+            market.get("outcomes"), field="outcomes"
+        )
+        prices = self._parse_string_array(
+            market.get("outcomePrices"), field="outcomePrices"
+        )
+        if not outcomes or not prices or len(outcomes) != len(prices):
+            return False, None
+
+        for name, price_str in zip(outcomes, prices):
+            try:
+                price = Decimal(str(price_str))
+            except (ValueError, ArithmeticError):
+                continue
+            if price >= Decimal("0.999"):
+                return True, name.strip().upper()
+        return False, None
+
     # ------------------------------------------------------------------ parsing
     @classmethod
     def _extract_token_id(cls, market_raw: dict[str, Any], outcome: str) -> str:

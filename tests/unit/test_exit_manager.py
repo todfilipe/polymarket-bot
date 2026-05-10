@@ -123,9 +123,11 @@ def _make_exit_manager(
     live_mode: bool = False,
     circuit_breaker=None,
     notifier=None,
+    resolution: tuple[bool, str | None] = (False, None),
 ) -> ExitManager:
     market_builder = MagicMock()
     market_builder.build = AsyncMock(return_value=snapshot)
+    market_builder.get_resolution_status = AsyncMock(return_value=resolution)
 
     cb = circuit_breaker or MagicMock()
     cb.record_stop_loss = AsyncMock()
@@ -180,6 +182,76 @@ async def test_hard_stop_loss_at_minus_41pct_closes_full(sessionmaker):
         assert fresh.status == PositionStatus.CLOSED
         assert fresh.realized_pnl_usd is not None
         assert fresh.notes == ExitReason.HARD_STOP_LOSS.value
+
+
+@pytest.mark.asyncio
+async def test_resolved_win_credits_correct_pnl(sessionmaker):
+    """Mercado resolveu YES e a posição era YES → fecha com P&L positivo
+    proporcional ao entry price. Em paper, $100 a 0.40 → resolve a $1 → +$150."""
+    await _seed_open_position(
+        sessionmaker, size_usd="100", avg_entry_price="0.40", outcome="YES"
+    )
+    # Snapshot não importa — o auto-settle dispara antes do fetch.
+    manager = _make_exit_manager(
+        sessionmaker, snapshot=None, resolution=(True, "YES")
+    )
+
+    [result] = await manager.check_all_positions()
+
+    assert result.exit_reason == ExitReason.RESOLVED_WIN
+    assert result.skipped is False
+    # P&L = size × (1/entry - 1) = 100 × (1/0.40 - 1) = 100 × 1.5 = 150
+    assert result.pnl_usd == Decimal("150")
+    # Não deve registar como stop loss (não é panic exit)
+    manager._circuit_breaker.record_stop_loss.assert_not_awaited()
+
+    async with sessionmaker() as s:
+        fresh = await s.get(Position, result.position_id)
+        assert fresh.status == PositionStatus.CLOSED
+        assert fresh.realized_pnl_usd == Decimal("150")
+        assert fresh.notes == ExitReason.RESOLVED_WIN.value
+
+
+@pytest.mark.asyncio
+async def test_resolved_loss_records_full_size_loss(sessionmaker):
+    """Mercado resolveu NO mas a posição era YES → posição vai a 0,
+    P&L = -size_usd."""
+    await _seed_open_position(
+        sessionmaker, size_usd="100", avg_entry_price="0.40", outcome="YES"
+    )
+    manager = _make_exit_manager(
+        sessionmaker, snapshot=None, resolution=(True, "NO")
+    )
+
+    [result] = await manager.check_all_positions()
+
+    assert result.exit_reason == ExitReason.RESOLVED_LOSS
+    assert result.pnl_usd == Decimal("-100")
+    # Não deve disparar circuit breaker — resolução natural ≠ stop loss
+    manager._circuit_breaker.record_stop_loss.assert_not_awaited()
+
+    async with sessionmaker() as s:
+        fresh = await s.get(Position, result.position_id)
+        assert fresh.status == PositionStatus.CLOSED
+        assert fresh.realized_pnl_usd == Decimal("-100")
+
+
+@pytest.mark.asyncio
+async def test_unresolved_market_falls_through_to_normal_checks(sessionmaker):
+    """Mercado ainda activo → auto-settle salta, evaluate continua para
+    stop loss / take profit / etc."""
+    await _seed_open_position(
+        sessionmaker, size_usd="100", avg_entry_price="0.50"
+    )
+    snap = _snapshot(mid_price="0.55")  # +10% gain, nada dispara
+    manager = _make_exit_manager(
+        sessionmaker, snapshot=snap, resolution=(False, None)
+    )
+
+    [result] = await manager.check_all_positions()
+
+    assert result.skipped is True
+    assert result.exit_reason is None
 
 
 @pytest.mark.asyncio

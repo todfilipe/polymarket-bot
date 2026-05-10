@@ -86,7 +86,8 @@ class TelegramCommander:
             _Command("status", "Estado atual do bot", "_cmd_status"),
             _Command("saldo", "Capital estimado e P&L", "_cmd_saldo"),
             _Command("posicoes", "Posições abertas", "_cmd_posicoes"),
-            _Command("historico", "Últimas 15 trades", "_cmd_historico"),
+            _Command("resultados", "Posições fechadas com P&L (últimas 20)", "_cmd_resultados"),
+            _Command("historico", "Últimas 15 trades executadas", "_cmd_historico"),
             _Command("skips", "Últimas 10 trades ignoradas", "_cmd_skips"),
             _Command("wallets", "Wallets seguidas", "_cmd_wallets"),
             _Command("semana", "Resumo da semana atual", "_cmd_semana"),
@@ -255,6 +256,63 @@ class TelegramCommander:
             lines.append(
                 f"• {_escape(question)} — {p.outcome} @ {float(p.avg_entry_price):.3f} | "
                 f"${float(p.size_usd):.2f} | aberta há {opened_age}"
+            )
+        await self._reply(chat_id, "\n".join(lines))
+
+    async def _cmd_resultados(self, chat_id: str) -> None:
+        """Posições fechadas com P&L individual e razão do exit. Mostra
+        claramente qual o resultado de cada trade — útil para auditoria."""
+        async with self._sessionmaker() as session:
+            stmt = (
+                select(Position)
+                .where(Position.status == PositionStatus.CLOSED)
+                .order_by(desc(Position.closed_at))
+                .limit(20)
+            )
+            positions = (await session.execute(stmt)).scalars().all()
+            market_questions = await _load_market_questions(
+                session, [p.market_id for p in positions]
+            )
+
+        if not positions:
+            await self._reply(chat_id, "📊 Sem posições fechadas ainda")
+            return
+
+        # Resumo agregado
+        total_pnl = sum(
+            (p.realized_pnl_usd or Decimal("0")) for p in positions
+        )
+        wins = [p for p in positions if (p.realized_pnl_usd or 0) > 0]
+        losses = [p for p in positions if (p.realized_pnl_usd or 0) < 0]
+        n_wins = len(wins)
+        n_losses = len(losses)
+        win_rate = (n_wins / len(positions)) * 100 if positions else 0
+
+        lines = [
+            f"📊 <b>Últimas {len(positions)} posições fechadas</b>",
+            f"P&L total: ${float(total_pnl):+.2f} | "
+            f"{n_wins}W / {n_losses}L ({win_rate:.0f}% wr)",
+            "",
+        ]
+
+        now = datetime.now(timezone.utc)
+        for p in positions:
+            pnl = p.realized_pnl_usd or Decimal("0")
+            pnl_pct = (
+                (float(pnl) / float(p.size_usd)) * 100 if p.size_usd else 0
+            )
+            icon = "🟢" if pnl > 0 else ("🔴" if pnl < 0 else "⚪")
+            reason = (p.notes or "?").replace("_", " ")
+            question = market_questions.get(p.market_id) or p.market_id
+            question = _truncate(question, 30)
+            age = (
+                _format_age(now - _aware(p.closed_at))
+                if p.closed_at else "?"
+            )
+            lines.append(
+                f"{icon} {_escape(question)} {_escape(p.outcome[:14])} "
+                f"${float(pnl):+.2f} ({pnl_pct:+.1f}%) — "
+                f"<i>{reason}</i> há {age}"
             )
         await self._reply(chat_id, "\n".join(lines))
 

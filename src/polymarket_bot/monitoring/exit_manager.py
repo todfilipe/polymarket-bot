@@ -66,6 +66,8 @@ class ExitReason(StrEnum):
     HARD_STOP_LOSS = "HARD_STOP_LOSS"
     TAKE_PROFIT_PARTIAL = "TAKE_PROFIT_PARTIAL"
     WALLET_EXIT = "WALLET_EXIT"
+    RESOLVED_WIN = "RESOLVED_WIN"
+    RESOLVED_LOSS = "RESOLVED_LOSS"
 
 
 @dataclass(frozen=True)
@@ -135,6 +137,12 @@ class ExitManager:
     # ------------------------------------------------------------------ per-position
     async def _evaluate_position(self, position: Position) -> ExitResult:
         log = logger.bind(position_id=position.id, market_id=position.market_id)
+
+        # 0) Auto-settle se o mercado já resolveu — antes de qualquer build,
+        # porque markets resolvidos têm orderbook vazio e o build falharia.
+        settled = await self._try_settle_resolved(position, log)
+        if settled is not None:
+            return settled
 
         # Snapshot de mercado (cache 30s no `MarketBuilder`).
         try:
@@ -479,6 +487,53 @@ class ExitManager:
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("exit_manager: notifier stop_loss falhou — {}", exc)
+
+    async def _try_settle_resolved(
+        self, position: Position, log: Any
+    ) -> ExitResult | None:
+        """Se o mercado da posição já resolveu, fecha-a com P&L baseado no
+        outcome vencedor. Devolve ``None`` se ainda não resolveu (caller
+        continua para os checks normais de stop loss / take profit / etc).
+
+        - **WIN**: o outcome da posição é o vencedor. Cada share que tens
+          passa a valer $1, então o valor final = ``size / entry``. P&L
+          positivo = ``size × (1/entry − 1)``.
+        - **LOSS**: o outcome perdeu. Posição vai a zero. P&L = ``-size``.
+        """
+        try:
+            is_resolved, winner = await self._market_builder.get_resolution_status(
+                position.market_id
+            )
+        except Exception as exc:  # noqa: BLE001 — best effort
+            log.debug(
+                "exit_manager: resolution check falhou para {} — {}",
+                position.market_id, exc,
+            )
+            return None
+        if not is_resolved:
+            return None
+
+        position_outcome = (position.outcome or "").upper()
+        if winner == position_outcome:
+            # WIN — cada share vale $1
+            final_value = position.size_usd / position.avg_entry_price
+            pnl_usd = final_value - position.size_usd
+            exit_price = Decimal("1.0")
+            reason = ExitReason.RESOLVED_WIN
+        else:
+            # LOSS — shares valem 0
+            pnl_usd = -position.size_usd
+            exit_price = Decimal("0.0")
+            reason = ExitReason.RESOLVED_LOSS
+
+        log.bind(
+            exit_reason=reason.value,
+            winner=winner,
+            position_outcome=position_outcome,
+            pnl_usd=str(pnl_usd),
+        ).info("exit: mercado resolveu — {}", reason.value)
+
+        return await self._close_full(position, reason, exit_price, pnl_usd)
 
     async def _notify_exit(
         self,

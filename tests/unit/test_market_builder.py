@@ -250,6 +250,60 @@ async def test_market_id_as_condition_id_uses_query_param():
 
 
 @pytest.mark.asyncio
+async def test_get_resolution_status_when_yes_won():
+    """Mercado binário resolvido com YES vencedor."""
+    gamma = _make_gamma_payload()
+    gamma["outcomePrices"] = '["1.0", "0.0"]'
+
+    async def fake_get(url: str, params=None):
+        return gamma if "/markets" in url else _make_book_payload()
+
+    builder = MarketBuilder(gamma_url="http://g", clob_url="http://c")
+    _install_get_mock(builder, fake_get)
+
+    is_resolved, winner = await builder.get_resolution_status("m1")
+    assert is_resolved is True
+    assert winner == "YES"
+
+
+@pytest.mark.asyncio
+async def test_get_resolution_status_when_not_resolved():
+    """Mercado ainda activo — preços normais (não 1.0/0.0)."""
+    gamma = _make_gamma_payload()
+    gamma["outcomePrices"] = '["0.65", "0.35"]'
+
+    async def fake_get(url: str, params=None):
+        return gamma if "/markets" in url else _make_book_payload()
+
+    builder = MarketBuilder(gamma_url="http://g", clob_url="http://c")
+    _install_get_mock(builder, fake_get)
+
+    is_resolved, winner = await builder.get_resolution_status("m1")
+    assert is_resolved is False
+    assert winner is None
+
+
+@pytest.mark.asyncio
+async def test_get_resolution_status_negrisk_multi_outcome():
+    """NegRisk: 1 outcome a 1.0, outros a 0.0."""
+    gamma = _make_gamma_payload(
+        outcomes='["Fenerbahce", "Galatasaray", "Besiktas"]',
+        clob_token_ids='["t1", "t2", "t3"]',
+    )
+    gamma["outcomePrices"] = '["0.0", "1.0", "0.0"]'
+
+    async def fake_get(url: str, params=None):
+        return gamma if "/markets" in url else _make_book_payload()
+
+    builder = MarketBuilder(gamma_url="http://g", clob_url="http://c")
+    _install_get_mock(builder, fake_get)
+
+    is_resolved, winner = await builder.get_resolution_status("m1")
+    assert is_resolved is True
+    assert winner == "GALATASARAY"
+
+
+@pytest.mark.asyncio
 async def test_negrisk_multi_outcome_resolves_correct_token():
     """Mercado multi-outcome (Polymarket NegRisk) — match por nome.
 
