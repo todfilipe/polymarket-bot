@@ -549,6 +549,16 @@ _BREAKEVEN_USD_THRESHOLD = 0.01
 
 VALID_RESULT_FILTERS = {"ALL", "WIN", "LOSS", "BREAKEVEN"}
 
+# Períodos suportados para filtro temporal — chave → (label, timedelta).
+# "all" = sem filtro temporal.
+_PERIOD_DELTAS: dict[str, timedelta | None] = {
+    "1h": timedelta(hours=1),
+    "24h": timedelta(hours=24),
+    "7d": timedelta(days=7),
+    "30d": timedelta(days=30),
+    "all": None,
+}
+
 
 def _classify_result(pnl_usd: float) -> str:
     if pnl_usd > _BREAKEVEN_USD_THRESHOLD:
@@ -562,6 +572,7 @@ def _classify_result(pnl_usd: float) -> str:
 async def api_positions_closed(
     result: str = Query("ALL"),
     wallet: str | None = Query(None),
+    period: str = Query("all"),
     page: int = Query(1, ge=1),
     per_page: int = Query(20, ge=1, le=100),
 ) -> dict[str, Any]:
@@ -570,16 +581,28 @@ async def api_positions_closed(
         raise HTTPException(
             status_code=400, detail=f"result inválido: {result}"
         )
+    period_lc = period.lower()
+    if period_lc not in _PERIOD_DELTAS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"period inválido: {period}. Válidos: {sorted(_PERIOD_DELTAS)}",
+        )
+    delta = _PERIOD_DELTAS[period_lc]
+    since_dt: datetime | None = (
+        datetime.now(timezone.utc) - delta if delta is not None else None
+    )
 
     try:
         async with await _open_session() as session:
+            stmt = (
+                select(Position)
+                .where(Position.status == PositionStatus.CLOSED)
+                .where(Position.realized_pnl_usd.isnot(None))
+            )
+            if since_dt is not None:
+                stmt = stmt.where(Position.closed_at >= since_dt)
             rows = (
-                await session.execute(
-                    select(Position)
-                    .where(Position.status == PositionStatus.CLOSED)
-                    .where(Position.realized_pnl_usd.isnot(None))
-                    .order_by(desc(Position.closed_at))
-                )
+                await session.execute(stmt.order_by(desc(Position.closed_at)))
             ).scalars().all()
     except SQLAlchemyError:
         return _empty_payload(
@@ -588,6 +611,7 @@ async def api_positions_closed(
                 "total": 0,
                 "page": page,
                 "per_page": per_page,
+                "period": period_lc,
                 "counts": {"WIN": 0, "LOSS": 0, "BREAKEVEN": 0, "ALL": 0},
             }
         )
@@ -683,9 +707,71 @@ async def api_positions_closed(
         "total": total,
         "page": page,
         "per_page": per_page,
+        "period": period_lc,
         "counts": counts,
         "db_offline": False,
     }
+
+
+# ---------------------------------------------------------------------------
+# /api/snapshots/weekly — snapshots semanais (paper-mode reset)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/snapshots/weekly")
+async def api_snapshots_weekly(
+    limit: int = Query(12, ge=1, le=52),
+) -> dict[str, Any]:
+    """Devolve os últimos N snapshots semanais (mais recente primeiro).
+
+    Cada snapshot é o "fecho" de uma semana paper-mode com capital inicial,
+    capital final, contagens e atribuição de wallets.
+    """
+    try:
+        async with await _open_session() as session:
+            from polymarket_bot.db.models import WeeklySnapshot
+
+            rows = (
+                await session.execute(
+                    select(WeeklySnapshot)
+                    .order_by(desc(WeeklySnapshot.started_at))
+                    .limit(limit)
+                )
+            ).scalars().all()
+    except SQLAlchemyError:
+        return _empty_payload({"snapshots": []})
+
+    snapshots = [
+        {
+            "id": s.id,
+            "week_iso": s.week_iso,
+            "is_paper": s.is_paper,
+            "started_at": _iso(s.started_at),
+            "ended_at": _iso(s.ended_at),
+            "capital_start_usd": _to_float(s.capital_start_usd),
+            "capital_end_usd": _to_float(s.capital_end_usd),
+            "pnl_usd": round(
+                _to_float(s.capital_end_usd) - _to_float(s.capital_start_usd), 2
+            ),
+            "pnl_pct": round(
+                (
+                    (_to_float(s.capital_end_usd) - _to_float(s.capital_start_usd))
+                    / max(_to_float(s.capital_start_usd), 1e-9)
+                )
+                * 100,
+                2,
+            ),
+            "pnl_realized_usd": _to_float(s.pnl_realized_usd),
+            "pnl_unrealized_at_close_usd": _to_float(s.pnl_unrealized_at_close_usd),
+            "n_positions_opened": int(s.n_positions_opened),
+            "n_positions_closed": int(s.n_positions_closed),
+            "n_wins": int(s.n_wins),
+            "n_losses": int(s.n_losses),
+            "n_force_closed": int(s.n_force_closed),
+            "wallets_followed": list(s.wallets_followed or []),
+        }
+        for s in rows
+    ]
+    return {"snapshots": snapshots, "db_offline": False}
 
 
 # ---------------------------------------------------------------------------

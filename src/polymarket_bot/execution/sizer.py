@@ -1,15 +1,15 @@
 """Dimensionamento de posições (CLAUDE.md §6, docx §4.2).
 
 Fórmula:
-    base = 5% da banca atual
+    base = ``CONST.BASE_SIZE_RATIO`` da banca atual (3%)
     × tier       (Top 3 = 1.4, Bottom 4 = 0.7)     — via ConsensusDecision
     × consenso   (2+ wallets = 1.3, 1 wallet = 0.5, all = 1.5) — via ConsensusDecision
     × recuperação (após 2 perdas consecutivas = 0.6)
-    HARD CAP: 8% da banca
-    MÍNIMO: $20 — abaixo disto, skip porque fees absorvem o lucro
+    HARD CAP: ``CONST.MAX_SIZE_RATIO`` (10%)
+    MÍNIMO: ``CONST.MIN_TRADE_USD`` ($1) — abaixo disto skip (CLOB não aceita).
 
 O sizer NÃO conhece o mercado nem o EV. Devolve apenas o tamanho proposto.
-O pipeline decide se avança (após validar depth, EV, limites de portfolio).
+O pipeline decide se avança (após validar depth, exposure, dedup, ruído).
 """
 
 from __future__ import annotations
@@ -46,7 +46,7 @@ def compute_size(
     consensus: ConsensusDecision,
     recovery_mode: bool = False,
 ) -> SizeDecision:
-    """Aplica a fórmula hierárquica com hard cap 8% e mínimo $20."""
+    """Aplica a fórmula hierárquica com hard cap CONST.MAX_SIZE_RATIO e mínimo CONST.MIN_TRADE_USD."""
     base = (bankroll_usd * Decimal(str(CONST.BASE_SIZE_RATIO))).quantize(
         Decimal("0.01"), rounding=ROUND_DOWN
     )

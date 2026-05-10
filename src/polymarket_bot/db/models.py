@@ -210,6 +210,55 @@ class DedupHash(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), index=True)
 
 
+class WeeklySnapshot(Base, TimestampMixin):
+    """Snapshot semanal — usado em paper mode para reset cíclico aos domingos.
+
+    Cada linha representa o "fecho" de uma semana: capital de entrada,
+    capital de saída (= entry + pnl_realized + pnl_unrealized_at_close),
+    contagens, e timestamps. Permite ao dashboard mostrar performance
+    isolada por cohort de 7 wallets.
+
+    A semana é identificada por ``week_iso`` no formato ``YYYY-Www`` (ex:
+    ``2026-W19``). UNIQUE para garantir 1 snapshot por semana.
+    """
+
+    __tablename__ = "weekly_snapshots"
+    __table_args__ = (UniqueConstraint("week_iso", name="uq_weekly_snapshot_week"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    week_iso: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    is_paper: Mapped[bool] = mapped_column(Boolean, nullable=False)
+
+    started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    ended_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+    # Capital de início e fim da semana
+    capital_start_usd: Mapped[Decimal] = mapped_column(Numeric(18, 6), nullable=False)
+    capital_end_usd: Mapped[Decimal] = mapped_column(Numeric(18, 6), nullable=False)
+
+    # Decomposição do P&L da semana
+    pnl_realized_usd: Mapped[Decimal] = mapped_column(Numeric(18, 6), nullable=False)
+    # P&L de posições que estavam ABERTAS no fim da semana e foram fechadas
+    # mark-to-market durante o reset (paper-mode only).
+    pnl_unrealized_at_close_usd: Mapped[Decimal] = mapped_column(
+        Numeric(18, 6), nullable=False, default=0
+    )
+
+    # Contagens
+    n_positions_opened: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    n_positions_closed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    n_wins: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    n_losses: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    n_force_closed: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )  # fechadas pelo reset (não por SL/TP/wallet exit)
+
+    # Wallets seguidas durante a semana (audit trail)
+    wallets_followed: Mapped[list[str]] = mapped_column(
+        JSON, nullable=False, default=list
+    )
+
+
 class CircuitBreakerState(Base, TimestampMixin):
     __tablename__ = "circuit_breaker_state"
 

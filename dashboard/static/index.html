@@ -571,6 +571,14 @@
           <button class="filter-btn" data-result="LOSS">Losses<span class="count" id="cnt-LOSS"></span></button>
           <button class="filter-btn" data-result="BREAKEVEN">Breakeven<span class="count" id="cnt-BREAKEVEN"></span></button>
         </div>
+        <div class="filter-row" id="closed-period-filters" style="margin-top:-4px">
+          <span class="text-muted" style="font-size:11px;text-transform:uppercase;letter-spacing:0.05em;align-self:center;margin-right:4px">Período:</span>
+          <button class="filter-btn" data-period="1h">Última hora</button>
+          <button class="filter-btn" data-period="24h">Último dia</button>
+          <button class="filter-btn" data-period="7d">Última semana</button>
+          <button class="filter-btn" data-period="30d">Último mês</button>
+          <button class="filter-btn active" data-period="all">Tudo</button>
+        </div>
         <div style="overflow-x:auto">
           <table id="closed-table">
             <thead>
@@ -623,6 +631,33 @@
       </div>
     </div>
 
+    <!-- Snapshots semanais (paper-mode reset cíclico) -->
+    <div class="panel" id="snapshots-panel" style="margin-bottom:16px;display:none">
+      <div class="panel-title">
+        <span>Snapshots semanais</span>
+        <span class="text-muted" style="font-size:11px">paper-mode · reset domingos 22:55 UTC</span>
+      </div>
+      <div style="overflow-x:auto">
+        <table id="snapshots-table">
+          <thead>
+            <tr>
+              <th>Semana</th>
+              <th class="nowrap">Período</th>
+              <th class="nowrap">Capital início</th>
+              <th class="nowrap">Capital fim</th>
+              <th class="nowrap">P&amp;L</th>
+              <th>Resultado</th>
+              <th class="nowrap" title="Posições fechadas / Forçadas pelo reset">Trades</th>
+              <th>Wallets</th>
+            </tr>
+          </thead>
+          <tbody id="snapshots-body">
+            <tr class="empty-row"><td colspan="8">Sem snapshots ainda — primeiro reset corre próximo domingo 22:55 UTC.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
     <div class="footer-note">
       Refresh automático a cada 30s · <span id="last-success">—</span>
     </div>
@@ -634,6 +669,7 @@
       closedPage: 1,
       closedPerPage: 20,
       closedResult: 'ALL',
+      closedPeriod: 'all',
       offlineEndpoints: new Set(),
       weekly: [],
     };
@@ -1095,6 +1131,49 @@
       el.innerHTML = html;
     }
 
+    function renderSnapshots(data) {
+      const panel = document.getElementById('snapshots-panel');
+      const tbody = document.getElementById('snapshots-body');
+      if (!data || !data.snapshots) return;
+
+      // Esconder o painel inteiro se nunca houve snapshots
+      if (data.snapshots.length === 0) {
+        panel.style.display = 'none';
+        return;
+      }
+      panel.style.display = 'block';
+
+      tbody.innerHTML = data.snapshots
+        .map((s) => {
+          const start = s.started_at ? new Date(s.started_at) : null;
+          const end = s.ended_at ? new Date(s.ended_at) : null;
+          const fmtShort = (d) => d ? d.toLocaleDateString('pt-PT', { day: '2-digit', month: '2-digit' }) : '—';
+          const period = `${fmtShort(start)} → ${fmtShort(end)}`;
+          const pnlCls = colorClass(s.pnl_usd);
+          const winLossRatio = (s.n_wins + s.n_losses) > 0
+            ? `${s.n_wins}W / ${s.n_losses}L`
+            : '—';
+          const tradesTitle = s.n_force_closed > 0
+            ? `${s.n_positions_closed + s.n_force_closed} fechadas (${s.n_force_closed} forçadas pelo reset)`
+            : `${s.n_positions_closed} fechadas`;
+          const walletsCount = (s.wallets_followed || []).length;
+          const walletsText = walletsCount > 0
+            ? `<span class="text-muted" title="${escapeHtml(s.wallets_followed.join(', '))}">${walletsCount} seguidas</span>`
+            : '<span class="text-muted">—</span>';
+          return `<tr>
+            <td><strong>${escapeHtml(s.week_iso)}</strong>${s.is_paper ? ' <span class="badge badge-yellow" style="font-size:10px">PAPER</span>' : ''}</td>
+            <td class="nowrap text-muted">${period}</td>
+            <td class="nowrap">${fmtMoney(s.capital_start_usd)}</td>
+            <td class="nowrap">${fmtMoney(s.capital_end_usd)}</td>
+            <td class="nowrap ${pnlCls}">${fmtMoney(s.pnl_usd)} <span class="text-muted">(${fmtPct(s.pnl_pct, true)})</span></td>
+            <td>${winLossRatio}</td>
+            <td class="nowrap text-muted" title="${escapeHtml(tradesTitle)}">${s.n_positions_closed + s.n_force_closed}</td>
+            <td>${walletsText}</td>
+          </tr>`;
+        })
+        .join('');
+    }
+
     // ===== Weekly chart (canvas) =====
     function drawWeeklyChart(weeks) {
       state.weekly = weeks || [];
@@ -1194,15 +1273,20 @@
     }
 
     // ===== Loaders =====
+    function closedUrl() {
+      return `/api/positions/closed?result=${state.closedResult}&period=${state.closedPeriod}&page=${state.closedPage}&per_page=${state.closedPerPage}`;
+    }
+
     async function loadAll() {
-      const [status, capital, positions, closed, wallets, risk, weekly] = await Promise.all([
+      const [status, capital, positions, closed, wallets, risk, weekly, snapshots] = await Promise.all([
         fetchJson('/api/status'),
         fetchJson('/api/capital'),
         fetchJson('/api/positions'),
-        fetchJson(`/api/positions/closed?result=${state.closedResult}&page=${state.closedPage}&per_page=${state.closedPerPage}`),
+        fetchJson(closedUrl()),
         fetchJson('/api/wallets'),
         fetchJson('/api/risk'),
         fetchJson('/api/performance/weekly'),
+        fetchJson('/api/snapshots/weekly?limit=12'),
       ]);
 
       renderStatus(status);
@@ -1212,6 +1296,7 @@
       renderWallets(wallets);
       renderRisk(risk);
       drawWeeklyChart(weekly && weekly.weeks);
+      renderSnapshots(snapshots);
       updateOfflineBanner();
 
       const now = new Date();
@@ -1221,8 +1306,7 @@
     }
 
     async function loadClosed() {
-      const url = `/api/positions/closed?result=${state.closedResult}&page=${state.closedPage}&per_page=${state.closedPerPage}`;
-      const data = await fetchJson(url);
+      const data = await fetchJson(closedUrl());
       renderClosed(data);
       updateOfflineBanner();
     }
@@ -1235,6 +1319,17 @@
           .forEach((b) => b.classList.remove('active'));
         btn.classList.add('active');
         state.closedResult = btn.dataset.result;
+        state.closedPage = 1;
+        loadClosed();
+      });
+    });
+    document.querySelectorAll('#closed-period-filters .filter-btn').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        document
+          .querySelectorAll('#closed-period-filters .filter-btn')
+          .forEach((b) => b.classList.remove('active'));
+        btn.classList.add('active');
+        state.closedPeriod = btn.dataset.period;
         state.closedPage = 1;
         loadClosed();
       });

@@ -4,6 +4,7 @@ Sequência UTC:
 
     22:00 dom   → `job_weekly_report`        — envia relatório via Telegram
     22:30 dom   → `job_close_removed_wallets`— marca posições órfãs para review
+    22:55 dom   → `job_paper_reset`          — paper only: fecha tudo + snapshot
     23:00 dom   → `job_score_wallets`        — check circuit breaker + scoring
     23:30 dom   → `job_select_top7`          — persiste novas 7 + recarrega monitor
     00:00 seg   → `job_reset_weekly_state`   — nova semana sem carry-over
@@ -15,7 +16,8 @@ notificados via Telegram e relogados, mas NÃO propagam.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Awaitable, Callable
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -32,10 +34,13 @@ from polymarket_bot.db.enums import (
     WalletTier,
 )
 from polymarket_bot.db.models import (
+    CircuitBreakerState,
     Position,
     Wallet,
     WalletScore,
+    WeeklySnapshot,
 )
+from polymarket_bot.monitoring.market_builder import MarketBuilder
 from polymarket_bot.monitoring.wallet_monitor import WalletMonitor
 from polymarket_bot.notifications.telegram_notifier import TelegramNotifier
 from polymarket_bot.portfolio.portfolio_manager import PortfolioManager
@@ -65,6 +70,9 @@ class _TopSelection:
 class RebalancingScheduler:
     """Orquestra os jobs de rebalanceamento semanal com `AsyncIOScheduler`."""
 
+    # Capital inicial usado em paper mode — referência para o reset semanal.
+    PAPER_INITIAL_CAPITAL_USD: Decimal = Decimal("1000")
+
     def __init__(
         self,
         monitor: WalletMonitor,
@@ -74,6 +82,8 @@ class RebalancingScheduler:
         data_client: PolymarketDataClient,
         session_factory: async_sessionmaker[AsyncSession],
         discovery_fn: DiscoveryFn | None = None,
+        live_mode: bool = False,
+        market_builder: MarketBuilder | None = None,
     ):
         self._monitor = monitor
         self._portfolio = portfolio
@@ -82,6 +92,8 @@ class RebalancingScheduler:
         self._data_client = data_client
         self._sessionmaker = session_factory
         self._discovery_fn = discovery_fn or discover_and_score
+        self._live_mode = live_mode
+        self._market_builder = market_builder
 
         self._scheduler = AsyncIOScheduler(timezone=timezone.utc)
         self._latest_scored: list[ScoredWallet] = []
@@ -96,7 +108,7 @@ class RebalancingScheduler:
             self._registered = True
         if not self._scheduler.running:
             self._scheduler.start()
-            logger.info("scheduler: iniciado (5 jobs, UTC)")
+            logger.info("scheduler: iniciado (6 jobs, UTC)")
 
     def stop(self) -> None:
         if self._scheduler.running:
@@ -117,6 +129,16 @@ class RebalancingScheduler:
             CronTrigger(day_of_week="sun", hour=22, minute=30, timezone=timezone.utc),
             args=["job_close_removed_wallets", self.job_close_removed_wallets],
             id="job_close_removed_wallets",
+            replace_existing=True,
+        )
+        # Reset paper-mode aos domingos às 22:55 UTC — fecha posições abertas
+        # mark-to-market, regista snapshot semanal, e reseta circuit breaker.
+        # No-op em LIVE_MODE (não toca em ordens reais).
+        self._scheduler.add_job(
+            self._safe_run,
+            CronTrigger(day_of_week="sun", hour=22, minute=55, timezone=timezone.utc),
+            args=["job_paper_reset", self.job_paper_reset],
+            id="job_paper_reset",
             replace_existing=True,
         )
         self._scheduler.add_job(
@@ -202,6 +224,183 @@ class RebalancingScheduler:
             "scheduler: close_removed_wallets inspeccionou {} posições, {} órfãs",
             len(open_positions),
             len(orphans),
+        )
+
+    async def job_paper_reset(self) -> None:
+        """Paper-mode only: fecha posições abertas + cria snapshot semanal.
+
+        Em paper, cada cohort de 7 wallets corre 1 semana. Aos domingos
+        22:55 fechamos tudo a preço actual (mark-to-market via Gamma) e
+        registamos um ``WeeklySnapshot`` com capital início/fim, contagens
+        e P&L. O ``CircuitBreakerState`` também reseta para NORMAL.
+
+        Em LIVE mode é no-op — não tocamos em ordens reais.
+
+        Os dados históricos ficam intactos: ``Position`` continua na DB
+        com ``status=CLOSED``, e o snapshot é só uma agregação.
+        """
+        if self._live_mode:
+            logger.info("scheduler: paper_reset — skip (LIVE mode)")
+            return
+
+        now = datetime.now(timezone.utc)
+        iso_cal = now.isocalendar()
+        week_iso = f"{iso_cal.year}-W{iso_cal.week:02d}"
+        # Início da semana = segunda 00:00 UTC desta semana ISO.
+        week_start = (now - timedelta(days=now.weekday())).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+
+        async with self._sessionmaker() as session:
+            # Idempotência: se já existe snapshot para esta semana, saltamos.
+            existing = (
+                await session.execute(
+                    select(WeeklySnapshot).where(WeeklySnapshot.week_iso == week_iso)
+                )
+            ).scalar_one_or_none()
+            if existing is not None:
+                logger.info(
+                    "scheduler: paper_reset — snapshot {} já existe, skip", week_iso
+                )
+                return
+
+            # Capital de início = $1000 + realized antes desta semana
+            pnl_before_stmt = select(Position.realized_pnl_usd).where(
+                Position.status == PositionStatus.CLOSED,
+                Position.realized_pnl_usd.is_not(None),
+                Position.closed_at < week_start,
+            )
+            pnl_before = sum(
+                (r for r in (await session.execute(pnl_before_stmt)).scalars().all() if r),
+                start=Decimal("0"),
+            )
+            capital_start = self.PAPER_INITIAL_CAPITAL_USD + pnl_before
+
+            # Posições fechadas DURANTE esta semana (antes do reset)
+            pnl_week_stmt = select(Position.realized_pnl_usd).where(
+                Position.status == PositionStatus.CLOSED,
+                Position.realized_pnl_usd.is_not(None),
+                Position.closed_at >= week_start,
+            )
+            pnl_realized_week = sum(
+                (r for r in (await session.execute(pnl_week_stmt)).scalars().all() if r),
+                start=Decimal("0"),
+            )
+
+            # Posições ainda abertas — fechar mark-to-market
+            open_stmt = select(Position).where(
+                Position.status == PositionStatus.OPEN
+            )
+            open_positions = list((await session.execute(open_stmt)).scalars().all())
+
+        # Buscar preços actuais via market_builder (pode falhar — toleramos)
+        forced_pnl_total = Decimal("0")
+        n_force_closed = 0
+        n_wins = 0
+        n_losses = 0
+        if open_positions and self._market_builder is not None:
+            for pos in open_positions:
+                try:
+                    snap = await self._market_builder.build(
+                        pos.market_id, pos.outcome
+                    )
+                    current_price = snap.implied_probability or pos.avg_entry_price
+                except Exception as exc:  # noqa: BLE001 — fallback a entry price
+                    logger.warning(
+                        "scheduler: paper_reset — falha a obter preço para {} ({}); "
+                        "uso avg_entry como fallback — {}",
+                        pos.market_id, pos.outcome, exc,
+                    )
+                    current_price = pos.avg_entry_price
+
+                if pos.avg_entry_price and pos.avg_entry_price > 0:
+                    pnl_ratio = (current_price / pos.avg_entry_price) - Decimal("1")
+                    pnl_usd = pos.size_usd * pnl_ratio
+                else:
+                    pnl_usd = Decimal("0")
+                forced_pnl_total += pnl_usd
+                if pnl_usd > Decimal("0.01"):
+                    n_wins += 1
+                elif pnl_usd < Decimal("-0.01"):
+                    n_losses += 1
+
+                async with self._sessionmaker() as session:
+                    fresh = await session.get(Position, pos.id)
+                    if fresh is None or fresh.status != PositionStatus.OPEN:
+                        continue
+                    fresh.status = PositionStatus.CLOSED
+                    fresh.closed_at = now
+                    fresh.realized_pnl_usd = pnl_usd
+                    fresh.notes = "paper_reset"
+                    await session.commit()
+                n_force_closed += 1
+
+        # Conta wins/losses das posições normalmente fechadas durante a semana
+        async with self._sessionmaker() as session:
+            week_closed_stmt = select(Position).where(
+                Position.status == PositionStatus.CLOSED,
+                Position.closed_at >= week_start,
+                Position.closed_at < now,  # exclui as do reset
+                Position.realized_pnl_usd.is_not(None),
+            )
+            week_closed = list(
+                (await session.execute(week_closed_stmt)).scalars().all()
+            )
+        for p in week_closed:
+            pnl = p.realized_pnl_usd or Decimal("0")
+            if pnl > Decimal("0.01"):
+                n_wins += 1
+            elif pnl < Decimal("-0.01"):
+                n_losses += 1
+
+        capital_end = capital_start + pnl_realized_week + forced_pnl_total
+
+        # Wallets seguidas durante a semana (snapshot do estado actual)
+        async with self._sessionmaker() as session:
+            wallets_stmt = select(Wallet.address).where(Wallet.is_followed == True)  # noqa: E712
+            wallets_followed = [
+                a for a in (await session.execute(wallets_stmt)).scalars().all()
+            ]
+
+            # Insert snapshot
+            snap_row = WeeklySnapshot(
+                week_iso=week_iso,
+                is_paper=True,
+                started_at=week_start,
+                ended_at=now,
+                capital_start_usd=capital_start,
+                capital_end_usd=capital_end,
+                pnl_realized_usd=pnl_realized_week,
+                pnl_unrealized_at_close_usd=forced_pnl_total,
+                n_positions_opened=len(week_closed) + n_force_closed,
+                n_positions_closed=len(week_closed),
+                n_wins=n_wins,
+                n_losses=n_losses,
+                n_force_closed=n_force_closed,
+                wallets_followed=wallets_followed,
+            )
+            session.add(snap_row)
+
+            # Reset circuit breaker para NORMAL — começa semana limpa
+            cb = CircuitBreakerState(
+                status=CircuitBreakerStatus.NORMAL,
+                reason=f"paper_reset {week_iso}",
+                consecutive_negative_weeks=0,
+                size_reduction_factor=1.0,
+            )
+            session.add(cb)
+            await session.commit()
+
+        logger.info(
+            "scheduler: paper_reset {} concluído — capital ${} → ${}, "
+            "{} fechadas (forçado {}), {}W/{}L",
+            week_iso,
+            float(capital_start),
+            float(capital_end),
+            len(week_closed) + n_force_closed,
+            n_force_closed,
+            n_wins,
+            n_losses,
         )
 
     async def job_score_wallets(self) -> None:

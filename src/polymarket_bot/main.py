@@ -35,6 +35,7 @@ from polymarket_bot.monitoring.chain_watcher import (
 )
 from polymarket_bot.monitoring.exit_manager import ExitManager
 from polymarket_bot.monitoring.market_builder import MarketBuilder
+from polymarket_bot.monitoring.noise_filter import NoiseFilter
 from polymarket_bot.monitoring.signal_reader import SignalReader
 from polymarket_bot.monitoring.wallet_monitor import WalletMonitor
 from polymarket_bot.notifications.telegram_commander import TelegramCommander
@@ -162,8 +163,11 @@ async def main() -> None:
     exposure_guard = ExposureGuard(
         session_factory=sessionmaker, initial_capital=Decimal("1000")
     )
+    noise_filter = NoiseFilter(session_factory=sessionmaker)
     pipeline = ExecutionPipeline(
-        order_manager=order_manager, exposure_guard=exposure_guard
+        order_manager=order_manager,
+        exposure_guard=exposure_guard,
+        noise_filter=noise_filter,
     )
     # Reader partilhado entre o WalletMonitor (poll_once para BUYs) e o
     # ExitManager (poll_sells para wallet exits). O cursor + dedup é único.
@@ -214,6 +218,7 @@ async def main() -> None:
         notifier=notifier,
         live_mode=settings.live_mode,
         chain_watcher=chain_watcher,
+        noise_filter=noise_filter,
     )
     scheduler = RebalancingScheduler(
         monitor=monitor,
@@ -222,6 +227,8 @@ async def main() -> None:
         notifier=notifier,
         data_client=data_client,
         session_factory=sessionmaker,
+        live_mode=settings.live_mode,
+        market_builder=market_builder,
     )
 
     await monitor.reload_followed_wallets()

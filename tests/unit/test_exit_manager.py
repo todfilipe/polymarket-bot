@@ -273,9 +273,9 @@ async def test_pnl_at_minus_39pct_does_not_exit(sessionmaker):
 
 
 @pytest.mark.asyncio
-async def test_take_profit_partial_closes_half_on_50pct_gain(sessionmaker):
-    """Trigger por LUCRO ≥ +50%, não por preço absoluto. Entry 0.40,
-    current 0.80 → +100% gain → bem acima do trigger."""
+async def test_high_profit_does_not_trigger_partial_take(sessionmaker):
+    """Após remover o TP parcial, +100% de lucro não fecha nada — vai até
+    ao fim (resolução, wallet exit ou SL). Pure copy."""
     pos = await _seed_open_position(
         sessionmaker, size_usd="100", avg_entry_price="0.40"
     )
@@ -284,55 +284,18 @@ async def test_take_profit_partial_closes_half_on_50pct_gain(sessionmaker):
 
     [result] = await manager.check_all_positions()
 
-    assert result.exit_reason == ExitReason.TAKE_PROFIT_PARTIAL
-    assert result.pnl_usd > 0
+    assert result.skipped is True
+    assert result.exit_reason is None
 
     async with sessionmaker() as s:
         parent = await s.get(Position, pos.id)
-        assert parent.size_usd == Decimal("50")   # 100 - 50%
-        assert parent.entries_count == 2
-        assert parent.status == PositionStatus.PARTIALLY_CLOSED
-        assert parent.notes == "partial_taken"
+        assert parent.status == PositionStatus.OPEN
+        assert parent.size_usd == Decimal("100")  # intacta
 
 
 @pytest.mark.asyncio
-async def test_take_profit_does_not_repeat_when_partial_already_taken(sessionmaker):
-    await _seed_open_position(
-        sessionmaker,
-        size_usd="50",
-        avg_entry_price="0.40",
-        notes="partial_taken",
-    )
-    snap = _snapshot(mid_price="0.82")
-    manager = _make_exit_manager(sessionmaker, snapshot=snap)
-
-    [result] = await manager.check_all_positions()
-
-    assert result.skipped is True
-    assert result.exit_reason is None
-
-
-@pytest.mark.asyncio
-async def test_high_entry_price_no_movement_does_not_trigger_partial(sessionmaker):
-    """Bug fix: entrar a 0.77 e o preço continuar a 0.77 não deve disparar
-    partial (lucro = 0%). Antes disparava porque o trigger era preço ≥ 0.75."""
-    await _seed_open_position(
-        sessionmaker, size_usd="100", avg_entry_price="0.77"
-    )
-    snap = _snapshot(mid_price="0.77")
-    manager = _make_exit_manager(sessionmaker, snapshot=snap)
-
-    [result] = await manager.check_all_positions()
-
-    assert result.skipped is True
-    assert result.exit_reason is None
-
-
-@pytest.mark.asyncio
-async def test_small_profit_does_not_trigger_partial(sessionmaker):
-    """Lucro <50% (mesmo perto da resolução) deixa correr — temporal exit
-    foi removido em favor de hold-to-resolution."""
-    # entry=0.40, current=0.45 → +12.5% lucro (abaixo do trigger +50%)
+async def test_small_profit_lets_run(sessionmaker):
+    """Lucro pequeno também não dispara nada — vai até ao fim."""
     await _seed_open_position(
         sessionmaker, size_usd="100", avg_entry_price="0.40"
     )

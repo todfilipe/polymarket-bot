@@ -596,6 +596,16 @@ class ChainWatcher:
         if price is None:
             return
 
+        # USDC subunits → USD (USDC tem 6 decimais on Polygon).
+        # BUY: maker paga USDC = makerAmount; SELL: maker recebe USDC = takerAmount.
+        if parsed.side == _SIDE_BUY:
+            usdc_subunits = parsed.maker_amount
+        else:
+            usdc_subunits = parsed.taker_amount
+        usd_value = (Decimal(usdc_subunits) / Decimal(1_000_000)).quantize(
+            Decimal("0.000001")
+        )
+
         wallet = self._followed_map[followed_addr]
         signal = DetectedSignal(
             wallet=wallet,
@@ -605,6 +615,7 @@ class ChainWatcher:
             detected_at=datetime.now(timezone.utc),
             tx_hash=parsed.tx_hash,
             side=side,
+            usd_value=usd_value,
         )
 
         try:

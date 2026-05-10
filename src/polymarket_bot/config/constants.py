@@ -17,7 +17,7 @@ class StrategyConstants:
 
     # --- Sizing ---
     BASE_SIZE_RATIO: float = 0.03   # base 3% da banca por trade (era 5%)
-    MAX_SIZE_RATIO: float = 0.08    # cap absoluto por posição
+    MAX_SIZE_RATIO: float = 0.10    # cap absoluto por posição (era 8%)
     MIN_TRADE_USD: float = 1.0      # mínimo CLOB ~$1 (era $20)
 
     # Multiplicadores de sizing
@@ -29,7 +29,7 @@ class StrategyConstants:
     ALL_WALLETS_MULTIPLIER: float = 1.5
 
     # --- Limites de portfolio (§7.1) ---
-    MAX_RATIO_PER_TRADE: float = 0.08
+    MAX_RATIO_PER_TRADE: float = 0.10  # alinhado com MAX_SIZE_RATIO (era 8%)
     MAX_RATIO_PER_CATEGORY: float = 0.25
     MAX_RATIO_PER_EVENT: float = 0.15
     MAX_RATIO_TOP3_COMBINED: float = 0.50
@@ -88,16 +88,27 @@ class StrategyConstants:
 
     # --- Saídas ---
     HARD_STOP_LOSS_PER_POSITION: float = -0.40
-    # Take profit parcial: dispara com base no LUCRO REALIZÁVEL, não no preço
-    # absoluto. Antes era "preço ≥ 0.75" o que disparava trades a acabar
-    # logo na entrada quando se entrava ≥ 0.75. Agora exige movimento real.
-    TAKE_PROFIT_PROFIT_TRIGGER: float = 0.50      # +50% de paper gain
-    TAKE_PROFIT_CLOSE_FRACTION: float = 0.50      # fecha 50% da posição
+    # Take profit parcial removido: incoerente com pure copy. A wallet decide
+    # quando sair (wallet exit), o SL ancorado a -40% é o backstop, e o
+    # auto-settle trata da resolução. Ir até ao fim em vez de colher metade
+    # ao chegar a +50% — em prediction markets, EV positivo está em deixar
+    # correr até resolução.
     MIN_WALLET_TIMING_SKILL: float = 0.60
 
     # --- Adições (§5.1) ---
     MOMENTUM_ADD_FRACTION: float = 0.50
-    MAX_ENTRIES_PER_POSITION: int = 2     # entrada inicial + 1 add
+    # MAX_ENTRIES_PER_POSITION removido: o cap absoluto (MAX_SIZE_RATIO=10%)
+    # serve de backstop; permitir N adds dentro do cap fica mais alinhado
+    # com pure copy quando a wallet faz DCA/fatiamento.
+
+    # --- Filtro de ruído (sizing-relativo) ---
+    # Trades da wallet abaixo desta fracção da mediana das últimas
+    # MEDIAN_WINDOW_WEEKS são considerados ruído (testes, erros, dust).
+    # Mediana é resistente a outliers (vs média), e o threshold é relativo
+    # à wallet — escala com whales e wallets humildes.
+    NOISE_FILTER_RATIO: float = 0.20            # 20% × mediana
+    NOISE_FILTER_MIN_HISTORY: int = 20          # mín. trades p/ aplicar filtro
+    MEDIAN_WINDOW_WEEKS: int = 4                # janela da mediana
 
     # --- Circuit breakers (§7.2, §10.1) ---
     RECOVERY_WEEKS_AFTER_STOP: int = 2

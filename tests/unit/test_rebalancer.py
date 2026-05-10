@@ -256,3 +256,123 @@ async def test_job_select_top7_skips_when_no_scored_results(sessionmaker):
     await scheduler.job_select_top7()
 
     monitor.reload_followed_wallets.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_job_paper_reset_skips_in_live_mode(sessionmaker):
+    """Em LIVE mode, o reset semanal é no-op — não toca em ordens reais."""
+    scheduler = _make_scheduler(sessionmaker)
+    # _make_scheduler default não passa live_mode, mas o construtor default
+    # é live_mode=False. Forçamos True para este teste.
+    scheduler._live_mode = True
+
+    await scheduler.job_paper_reset()
+
+    # Nenhum snapshot criado
+    from polymarket_bot.db.models import WeeklySnapshot
+    async with sessionmaker() as s:
+        rows = (await s.execute(select(WeeklySnapshot))).scalars().all()
+    assert len(rows) == 0
+
+
+@pytest.mark.asyncio
+async def test_job_paper_reset_creates_snapshot_and_closes_open_positions(
+    sessionmaker,
+):
+    """Paper reset: posições abertas → fechadas mark-to-market, snapshot criado,
+    circuit breaker reset para NORMAL."""
+    from datetime import timedelta
+    from polymarket_bot.db.enums import PositionStatus, TradeSide
+    from polymarket_bot.db.models import Position, WeeklySnapshot
+
+    # Seed: 1 position fechada (win) + 1 aberta
+    week_start = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    week_start = week_start - timedelta(days=week_start.weekday())
+    closed_pos = Position(
+        market_id="evt_a",
+        outcome="YES",
+        side=TradeSide.BUY,
+        status=PositionStatus.CLOSED,
+        is_paper=True,
+        size_usd=Decimal("50"),
+        avg_entry_price=Decimal("0.40"),
+        entries_count=1,
+        opened_at=week_start + timedelta(hours=1),
+        closed_at=week_start + timedelta(hours=5),
+        realized_pnl_usd=Decimal("15"),  # WIN
+        followed_wallets=["0xabc"],
+    )
+    open_pos = Position(
+        market_id="evt_b",
+        outcome="YES",
+        side=TradeSide.BUY,
+        status=PositionStatus.OPEN,
+        is_paper=True,
+        size_usd=Decimal("30"),
+        avg_entry_price=Decimal("0.50"),
+        entries_count=1,
+        opened_at=week_start + timedelta(hours=2),
+        closed_at=None,
+        realized_pnl_usd=None,
+        followed_wallets=["0xdef"],
+    )
+    async with sessionmaker() as s:
+        s.add_all([closed_pos, open_pos])
+        await s.commit()
+
+    # Mock market_builder a devolver preço actual = 0.60 (open_pos vence +20%)
+    market_builder = MagicMock()
+    market_snap = SimpleNamespace(implied_probability=Decimal("0.60"))
+    market_builder.build = AsyncMock(return_value=market_snap)
+
+    scheduler = _make_scheduler(sessionmaker)
+    scheduler._live_mode = False
+    scheduler._market_builder = market_builder
+
+    await scheduler.job_paper_reset()
+
+    # Snapshot criado
+    async with sessionmaker() as s:
+        snapshots = (
+            await s.execute(select(WeeklySnapshot))
+        ).scalars().all()
+        assert len(snapshots) == 1
+        snap = snapshots[0]
+        assert snap.is_paper is True
+        # capital_start = $1000 + 0 (sem PNL anterior) = $1000
+        assert snap.capital_start_usd == Decimal("1000")
+        # pnl_realized_week = $15 (closed_pos)
+        assert snap.pnl_realized_usd == Decimal("15")
+        # pnl unrealized do open_pos = 30 × ((0.60/0.50) − 1) = $6
+        assert snap.pnl_unrealized_at_close_usd == Decimal("6")
+        # capital_end = 1000 + 15 + 6 = 1021
+        assert snap.capital_end_usd == Decimal("1021")
+        assert snap.n_force_closed == 1
+        assert snap.n_wins == 2  # closed_pos win + open_pos paper-closed win
+
+        # Open_pos fechada com paper_reset
+        fresh = await s.get(Position, open_pos.id)
+        assert fresh.status == PositionStatus.CLOSED
+        assert fresh.notes == "paper_reset"
+        assert fresh.realized_pnl_usd == Decimal("6")
+
+
+@pytest.mark.asyncio
+async def test_job_paper_reset_idempotent_same_week(sessionmaker):
+    """Correr duas vezes na mesma semana não cria duplicado."""
+    market_builder = MagicMock()
+    market_builder.build = AsyncMock()
+
+    scheduler = _make_scheduler(sessionmaker)
+    scheduler._live_mode = False
+    scheduler._market_builder = market_builder
+
+    await scheduler.job_paper_reset()
+    await scheduler.job_paper_reset()
+
+    from polymarket_bot.db.models import WeeklySnapshot
+    async with sessionmaker() as s:
+        rows = (await s.execute(select(WeeklySnapshot))).scalars().all()
+    assert len(rows) == 1

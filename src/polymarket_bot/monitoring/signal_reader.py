@@ -50,7 +50,12 @@ class FollowedWallet:
 @dataclass(frozen=True)
 class DetectedSignal:
     """Trade nova detectada numa wallet seguida. Default `side=BUY` mantém
-    retrocompatibilidade — `poll_sells()` preenche `side=SELL`."""
+    retrocompatibilidade — `poll_sells()` preenche `side=SELL`.
+
+    `usd_value` = tamanho do trade da wallet em USD (subjacente ao filtro de
+    ruído). Default 0 mantém retrocompat com testes/contextos onde não se
+    sabe o tamanho — o filtro tolera (deixa passar quando 0).
+    """
 
     wallet: FollowedWallet
     market_id: str
@@ -59,6 +64,7 @@ class DetectedSignal:
     detected_at: datetime
     tx_hash: str
     side: TradeSide = TradeSide.BUY
+    usd_value: Decimal = Decimal("0")
 
 
 @dataclass
@@ -220,6 +226,7 @@ class SignalReader:
                         detected_at=trade.executed_at,
                         tx_hash=trade.tx_hash,
                         side=trade.side,
+                        usd_value=trade.usd_value,
                     )
                 )
                 cursor.seen_tx_hashes.add(trade.tx_hash)

@@ -2,12 +2,12 @@
 
 Verificações sobre o estado actual das posições abertas:
 
-    1. Máx. 10 posições abertas simultâneas.
+    1. Máx. ``CONST.MAX_OPEN_POSITIONS`` posições abertas simultâneas.
     2. Cash reserve ≥ 30% da banca após abrir a nova posição.
     3. Máx. 15% da banca por evento (condition_id partilhado YES/NO).
-    4. Máx. 8% da banca por **posição** (= ``(wallet, market, outcome, side)``).
-       Wallets que pyramidem deixam de poder crescer a posição além de 8% —
-       evita que 5 entradas pequenas componham uma posição de 30%+ da banca.
+    4. Máx. ``CONST.MAX_SIZE_RATIO`` da banca por **posição** (= ``(wallet,
+       market, outcome, side)``). Backstop final contra pyramiding — uma
+       wallet que faça N entradas só pode acumular até ao cap, depois SKIP.
 
 Sem estado em memória — cada `check()` faz queries frescas à DB.
 """
@@ -20,14 +20,17 @@ from decimal import Decimal
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from polymarket_bot.config.constants import CONST
 from polymarket_bot.db.enums import PositionStatus, TradeSide
 from polymarket_bot.db.models import Position
 from polymarket_bot.market.models import MarketSnapshot
 
-MAX_OPEN_POSITIONS = 30
-CASH_RESERVE_RATIO = Decimal("0.30")
-MAX_EVENT_EXPOSURE_RATIO = Decimal("0.15")
-MAX_POSITION_EXPOSURE_RATIO = Decimal("0.08")  # cap absoluto por posição
+# Constantes derivadas do singleton CONST — single source of truth. Mantemos
+# wrappers em Decimal aqui para evitar conversões repetidas no hot path.
+MAX_OPEN_POSITIONS = CONST.MAX_OPEN_POSITIONS
+CASH_RESERVE_RATIO = Decimal(str(CONST.CASH_RESERVE_RATIO))
+MAX_EVENT_EXPOSURE_RATIO = Decimal(str(CONST.MAX_RATIO_PER_EVENT))
+MAX_POSITION_EXPOSURE_RATIO = Decimal(str(CONST.MAX_SIZE_RATIO))
 EVENT_KEY_LEN = 42
 
 
@@ -86,12 +89,13 @@ class ExposureGuard:
             cap = bankroll_usd * MAX_POSITION_EXPOSURE_RATIO
             if new_total > cap:
                 pct = float(new_total / bankroll_usd) if bankroll_usd > 0 else 0.0
+                cap_pct = float(MAX_POSITION_EXPOSURE_RATIO)
                 return ExposureCheckResult(
                     passes=False,
                     reason=(
-                        f"posição já a 8% — entry adicional saltada "
+                        f"posição já no cap — entry adicional saltada "
                         f"(existing=${float(existing_size):.2f} + new=${float(size_usd):.2f} "
-                        f"= {pct:.1%} > 8%)"
+                        f"= {pct:.1%} > {cap_pct:.0%})"
                     ),
                     open_positions=count,
                     capital_deployed_pct=0.0,

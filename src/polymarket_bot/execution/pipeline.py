@@ -2,15 +2,18 @@
 
 Ordem dos gates (falha em qualquer = skip com motivo registado):
 
-    1. Consenso das wallets (direção, força, tier)
-    2. Filtros de mercado (volume, tempo, probabilidade)
-    3. Estimativa de true_probability + EV margin check
-    4. Sizing (tier × consenso × recuperação, cap 8%, mín $20)
-    5. Depth check do orderbook (para o size decidido)
-    6. Submit via OrderManager (dry-run ou live)
+    0. Filtro de ruído — descarta sinais com tamanho < 20% da mediana da wallet
+    1. Sizing (tier × consenso × recuperação, cap CONST.MAX_SIZE_RATIO)
+    2. Depth check do orderbook (para o size decidido)
+    3. Exposure guard (cap/posição, evento, cash reserve, máx posições)
+    4. Dedup (tx_hash) + submit via OrderManager (dry-run ou live)
 
-Cada skip é persistido em `BotTrade` com status=SKIPPED para análise semanal
-(§12 — "trades ignoradas com motivos desagregados").
+Filtros de **alpha** (EV mínimo, volume, janela de probabilidade, tempo,
+consenso) foram removidos — pure copytrade. Só ficam protecções de
+capital físico (sizing cap, exposure, depth) + filtro de ruído baseado no
+padrão histórico de cada wallet.
+
+Cada skip é persistido em `BotTrade` com status=SKIPPED para análise semanal.
 """
 
 from __future__ import annotations
@@ -43,6 +46,7 @@ from polymarket_bot.market import (
 
 if TYPE_CHECKING:
     from polymarket_bot.execution.order_manager import OrderManager, SubmissionResult
+    from polymarket_bot.monitoring.noise_filter import NoiseFilter
     from polymarket_bot.portfolio.exposure_guard import ExposureGuard
 
 
@@ -55,6 +59,7 @@ class PipelineOutcome(StrEnum):
     SKIPPED_DEPTH = "SKIPPED_DEPTH"
     SKIPPED_EXPOSURE = "SKIPPED_EXPOSURE"
     SKIPPED_DUPLICATE = "SKIPPED_DUPLICATE"
+    SKIPPED_NOISE = "SKIPPED_NOISE"
     FAILED = "FAILED"
 
 
@@ -63,8 +68,9 @@ class SignalInput:
     """Sinal de uma wallet + dados que acompanham (fornecidos pelo caller)."""
 
     signal: WalletSignal
-    win_rate: float             # win rate histórico da wallet (do scoring)
-    tx_hash: str = ""           # tx on-chain originária — alimenta o dedup
+    win_rate: float                       # win rate histórico da wallet (do scoring)
+    tx_hash: str = ""                     # tx on-chain originária — alimenta o dedup
+    trade_usd: Decimal = Decimal("0")     # tamanho do trade da wallet em USD (filtro de ruído)
 
 
 @dataclass(frozen=True)
@@ -100,21 +106,76 @@ class ExecutionPipeline:
         self,
         order_manager: "OrderManager",
         exposure_guard: "ExposureGuard | None" = None,
+        noise_filter: "NoiseFilter | None" = None,
     ):
         self._order_manager = order_manager
         self._exposure_guard = exposure_guard
+        self._noise_filter = noise_filter
 
     async def evaluate(self, ctx: PipelineContext) -> PipelineResult:
         """Modo "copytrade puro": só fica entre o sinal e a execução o que é
-        protecção de **capital** (sizing cap, exposure, dedup, depth físico).
+        protecção de **capital** (sizing cap, exposure, dedup, depth físico)
+        + filtro de **ruído** (trades muito abaixo da mediana da wallet).
 
         Removidos os filtros de **alpha** — EV mínimo, volume mínimo, janela
         de probabilidade, tempo até resolução, regra de consenso.
         Hipótese: as wallets seguidas são lucrativas precisamente pelo conjunto
         das suas trades; filtrar selectivamente cortava alpha sem garantia de
         melhoria. Risco controlado por size cap + exposure + stop loss.
+
+        O filtro de ruído opera **por sinal individual** — se uma wallet faz
+        um trade < 20% da mediana dela, esse sinal é descartado. Aplica a
+        todas as entradas (1ª e adds) — caso contrário, depois de uma 1ª
+        legítima, qualquer trade de $1 da mesma wallet passaria.
         """
         log = logger.bind(market_id=ctx.market.market_id)
+
+        # ---- 0. Filtro de ruído por wallet (early gate) ----
+        # Aplicado antes do sizing porque é computacionalmente barato e
+        # o objectivo é descartar ruído cedo. Se houver múltiplos sinais
+        # para o mesmo (market, outcome) e algum deles for ruído, esse
+        # signal é removido — os restantes seguem.
+        if self._noise_filter is not None and ctx.signals:
+            kept: list[SignalInput] = []
+            skipped_reasons: list[str] = []
+            for s in ctx.signals:
+                # trade_usd=0 significa "tamanho desconhecido" (legacy/test) —
+                # deixa passar (não temos como decidir).
+                if s.trade_usd <= 0:
+                    kept.append(s)
+                    continue
+                decision = await self._noise_filter.evaluate(
+                    wallet_address=s.signal.wallet_address,
+                    trade_usd=s.trade_usd,
+                )
+                if decision.passes:
+                    kept.append(s)
+                else:
+                    skipped_reasons.append(
+                        f"{s.signal.wallet_address[:8]}: {decision.reason}"
+                    )
+            if not kept:
+                reason = "todos os sinais classificados como ruído: " + " | ".join(
+                    skipped_reasons
+                )
+                log.info("skip: noise — {}", reason)
+                return PipelineResult(
+                    outcome=PipelineOutcome.SKIPPED_NOISE,
+                    reason=reason,
+                )
+            if skipped_reasons:
+                log.debug(
+                    "noise filter dropped {} signals: {}",
+                    len(skipped_reasons),
+                    skipped_reasons,
+                )
+            # Substituir signals por kept para os próximos passos
+            ctx = PipelineContext(
+                market=ctx.market,
+                signals=kept,
+                bankroll_usd=ctx.bankroll_usd,
+                recovery_mode=ctx.recovery_mode,
+            )
 
         # Consenso é executado apenas para extrair multiplicadores de sizing;
         # nunca aborta — sinais já vêm agrupados por (market, outcome) pelo
@@ -133,7 +194,7 @@ class ExecutionPipeline:
             else None
         )
 
-        # ---- 1. Sizing (8% cap, tier weights, signal multiplier) ----
+        # ---- 1. Sizing (cap, tier weights, signal multiplier) ----
         size_decision = compute_size(ctx.bankroll_usd, consensus, ctx.recovery_mode)
         if not size_decision.should_execute:
             log.info("skip: size — {}", size_decision.skip_reason)
@@ -173,10 +234,11 @@ class ExecutionPipeline:
                 depth=depth,
             )
 
-        # ---- 3. Exposure guard (8%/posição, 15%/evento, cash 30%, máx 10) ----
+        # ---- 3. Exposure guard (cap/posição via CONST.MAX_SIZE_RATIO,
+        #         15%/evento, cash 30%, máx CONST.MAX_OPEN_POSITIONS) ----
         if self._exposure_guard is not None:
             # Passa wallet_address para que o guard possa aplicar o cap por
-            # posição (evita pyramiding além de 8% via múltiplas entradas).
+            # posição (backstop final contra pyramiding além do cap).
             exposure = await self._exposure_guard.check(
                 market=ctx.market,
                 size_usd=size_decision.final_size_usd,

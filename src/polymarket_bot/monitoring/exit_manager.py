@@ -55,16 +55,12 @@ class LiveExitError(Exception):
     """
 
 HARD_STOP_LOSS_RATIO = Decimal(str(CONST.HARD_STOP_LOSS_PER_POSITION))
-TAKE_PROFIT_TRIGGER = Decimal(str(CONST.TAKE_PROFIT_PROFIT_TRIGGER))
-TAKE_PROFIT_CLOSE_FRACTION = Decimal(str(CONST.TAKE_PROFIT_CLOSE_FRACTION))
 
-_NOTE_PARTIAL_TAKEN = "partial_taken"
 _NOTE_EXIT_PENDING_MANUAL = "exit_pending_manual"
 
 
 class ExitReason(StrEnum):
     HARD_STOP_LOSS = "HARD_STOP_LOSS"
-    TAKE_PROFIT_PARTIAL = "TAKE_PROFIT_PARTIAL"
     WALLET_EXIT = "WALLET_EXIT"
     RESOLVED_WIN = "RESOLVED_WIN"
     RESOLVED_LOSS = "RESOLVED_LOSS"
@@ -202,24 +198,7 @@ class ExitManager:
                 await self._after_stop_loss(sl_trigger_ratio)
             return result
 
-        # 2) Take profit parcial — dispara quando o lucro REALIZÁVEL atinge o
-        # threshold (default +50%). Vende 50%, ficando-se com upside na metade
-        # restante (que continua sob hard stop loss e wallet exit).
-        # Apenas 1× por posição (`_NOTE_PARTIAL_TAKEN`).
-        if (
-            pnl_ratio >= TAKE_PROFIT_TRIGGER
-            and position.entries_count == 1
-            and position.notes != _NOTE_PARTIAL_TAKEN
-        ):
-            log.bind(
-                exit_reason=ExitReason.TAKE_PROFIT_PARTIAL.value,
-                pnl_ratio=f"{float(pnl_ratio):.3f}",
-            ).info("exit: take profit parcial (+{:.0%})", float(pnl_ratio))
-            return await self._close_partial(
-                position, current_price
-            )
-
-        # 4) Wallet exit — segue sempre que a wallet que originou esta position
+        # 2) Wallet exit — segue sempre que a wallet que originou esta position
         # vende. Como cada Position é per-wallet (upsert scoped por wallet em
         # `OrderManager._upsert_open_position`), `_detect_wallet_exits` só
         # devolve a wallet desta position. Sem threshold de skill: confiamos
@@ -268,74 +247,6 @@ class ExitManager:
             outcome=position.outcome,
             exit_reason=reason,
             pnl_usd=pnl_usd,
-            is_paper=not self._live_mode,
-            skipped=False,
-            skip_reason=None,
-        )
-
-    async def _close_partial(
-        self,
-        position: Position,
-        current_price: Decimal,
-    ) -> ExitResult:
-        """Fecha 50% do size — cria posição-filha CLOSED, reduz original."""
-        partial_size = position.size_usd * TAKE_PROFIT_CLOSE_FRACTION
-        partial_pnl = partial_size * (
-            (current_price / position.avg_entry_price) - Decimal("1")
-        )
-
-        if self._live_mode:
-            try:
-                await self._submit_live_exit(
-                    position, current_price, fraction=TAKE_PROFIT_CLOSE_FRACTION
-                )
-            except (LiveExitError, NotImplementedError) as exc:
-                return await self._mark_pending_manual(
-                    position, ExitReason.TAKE_PROFIT_PARTIAL, partial_pnl, exc
-                )
-
-        now = datetime.now(timezone.utc)
-        async with self._sessionmaker() as session:
-            fresh = await session.get(Position, position.id)
-            if fresh is None or fresh.status != PositionStatus.OPEN:
-                return _skipped(position, self._live_mode, "posição já fechada")
-            if fresh.notes == _NOTE_PARTIAL_TAKEN:
-                return _skipped(
-                    position, self._live_mode, "partial já tomado (idempotência)"
-                )
-
-            child = Position(
-                market_id=fresh.market_id,
-                outcome=fresh.outcome,
-                side=fresh.side,
-                status=PositionStatus.CLOSED,
-                is_paper=fresh.is_paper,
-                size_usd=partial_size,
-                avg_entry_price=fresh.avg_entry_price,
-                entries_count=1,
-                opened_at=fresh.opened_at,
-                closed_at=now,
-                realized_pnl_usd=partial_pnl,
-                followed_wallets=list(fresh.followed_wallets or []),
-                notes=ExitReason.TAKE_PROFIT_PARTIAL.value,
-            )
-            session.add(child)
-
-            fresh.size_usd = fresh.size_usd - partial_size
-            fresh.entries_count = fresh.entries_count + 1
-            fresh.status = PositionStatus.PARTIALLY_CLOSED
-            fresh.notes = _NOTE_PARTIAL_TAKEN
-            await session.commit()
-
-        await self._notify_exit(
-            ExitReason.TAKE_PROFIT_PARTIAL, position, partial_pnl, current_price
-        )
-        return ExitResult(
-            position_id=position.id,
-            market_id=position.market_id,
-            outcome=position.outcome,
-            exit_reason=ExitReason.TAKE_PROFIT_PARTIAL,
-            pnl_usd=partial_pnl,
             is_paper=not self._live_mode,
             skipped=False,
             skip_reason=None,

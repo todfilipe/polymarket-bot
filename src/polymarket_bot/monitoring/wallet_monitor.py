@@ -47,6 +47,7 @@ from polymarket_bot.db.models import (
     Position,
     Wallet,
     WalletScore,
+    WalletTrade,
 )
 from polymarket_bot.execution.dedup import compute_dedup_hash
 from polymarket_bot.execution.pipeline import (
@@ -60,6 +61,7 @@ from polymarket_bot.market import MarketSnapshot, WalletSignal
 from polymarket_bot.monitoring.chain_watcher import ChainWatcher
 from polymarket_bot.monitoring.exit_manager import ExitManager
 from polymarket_bot.monitoring.market_builder import MarketBuilder, MarketBuildError
+from polymarket_bot.monitoring.noise_filter import NoiseFilter
 from polymarket_bot.monitoring.signal_reader import (
     DetectedSignal,
     FollowedWallet,
@@ -99,6 +101,7 @@ class WalletMonitor:
         notifier: TelegramNotifier | None = None,
         live_mode: bool = False,
         chain_watcher: ChainWatcher | None = None,
+        noise_filter: NoiseFilter | None = None,
     ):
         self._pipeline = pipeline
         self._data_client = data_client
@@ -115,6 +118,10 @@ class WalletMonitor:
         self._chain_watcher = chain_watcher
         self._chain_task: asyncio.Task[None] | None = None
         self._stop_event = asyncio.Event()
+        # Filtro de ruído — quando set, persistimos cada signal em wallet_trades
+        # e invalidamos a cache da mediana. Mantém o filtro fresh durante a
+        # semana sem esperar pelo scoring de domingo.
+        self._noise_filter = noise_filter
 
     # ------------------------------------------------------------------ public
     async def run_forever(self) -> None:
@@ -230,6 +237,11 @@ class WalletMonitor:
         if not signals:
             return
 
+        # Persistir trades em wallet_trades (idempotente via UniqueConstraint
+        # wallet_address + tx_hash) — alimenta o histórico em tempo real para
+        # a mediana do filtro de ruído. Best-effort: se falhar, segue.
+        await self._persist_signals_to_history(signals)
+
         groups = self._group_by_market(signals)
         for (market_id, outcome), group in groups.items():
             await self._process_group(
@@ -238,6 +250,61 @@ class WalletMonitor:
                 group=group,
                 state=state,
             )
+
+    async def _persist_signals_to_history(
+        self, signals: list[DetectedSignal]
+    ) -> None:
+        """Insere sinais BUY em ``wallet_trades`` (real-time history feed).
+
+        Alimenta a mediana do filtro de ruído e o scoring entre rebalances.
+        Idempotente — `UniqueConstraint(wallet_address, tx_hash)` evita
+        duplicados se o mesmo trade for visto via chain + API.
+        """
+        if not signals:
+            return
+
+        # SELLs também são úteis para a mediana (proxy de tamanho típico),
+        # mas para já só persistimos BUYs para alinhar com o que o filtro
+        # de ruído avalia (entradas).
+        buys = [s for s in signals if s.side == TradeSide.BUY]
+        if not buys:
+            return
+
+        async with self._sessionmaker() as session:
+            for s in buys:
+                if not s.tx_hash or s.usd_value <= 0:
+                    continue
+                # Calcula `size` a partir de price + usd_value (para schema):
+                # size_shares = usd_value / price.
+                price = s.price if s.price > 0 else Decimal("0.0001")
+                size_shares = (s.usd_value / price).quantize(Decimal("0.000001"))
+                trade = WalletTrade(
+                    wallet_address=s.wallet.address.lower(),
+                    tx_hash=s.tx_hash,
+                    market_id=s.market_id,
+                    side=s.side,
+                    outcome=s.outcome,
+                    price=s.price,
+                    size=size_shares,
+                    usd_value=s.usd_value,
+                    executed_at=s.detected_at,
+                )
+                session.add(trade)
+                try:
+                    await session.commit()
+                except IntegrityError:
+                    # Já existe (visto antes via outro source) — ignora.
+                    await session.rollback()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "wallet_monitor: falha a persistir wallet_trade — {}", exc
+                    )
+                    await session.rollback()
+                else:
+                    # Invalida cache do filtro de ruído para esta wallet —
+                    # próxima avaliação recalcula a mediana com este trade.
+                    if self._noise_filter is not None:
+                        await self._noise_filter.invalidate(s.wallet.address)
 
     async def _process_group(
         self,
@@ -268,6 +335,7 @@ class WalletMonitor:
                 ),
                 win_rate=s.wallet.win_rate,
                 tx_hash=s.tx_hash,
+                trade_usd=s.usd_value,
             )
             for s in group
         ]
