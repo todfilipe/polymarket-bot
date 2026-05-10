@@ -84,6 +84,95 @@ async def test_passes_when_no_open_positions(sessionmaker):
 
 
 @pytest.mark.asyncio
+async def test_rejects_entry_that_pushes_position_over_8pct(sessionmaker):
+    """Posição existente da mesma wallet a $60. Nova entrada de $30 pediria
+    posição agregada de $90 = 9% da banca → bloqueia (cap 8%)."""
+    existing = Position(
+        market_id="evt_x",
+        outcome="YES",
+        side=TradeSide.BUY,
+        status=PositionStatus.OPEN,
+        is_paper=True,
+        size_usd=Decimal("60"),
+        avg_entry_price=Decimal("0.40"),
+        entries_count=2,
+        opened_at=datetime.now(timezone.utc),
+        closed_at=None,
+        realized_pnl_usd=None,
+        followed_wallets=["0xabc"],
+    )
+    await _add(sessionmaker, existing)
+
+    guard = ExposureGuard(session_factory=sessionmaker)
+    market = make_snapshot(market_id="evt_x", outcome="YES")
+
+    result = await guard.check(
+        market=market,
+        size_usd=Decimal("30"),
+        bankroll_usd=Decimal("1000"),
+        followed_wallet="0xabc",
+        side=TradeSide.BUY,
+    )
+
+    assert not result.passes
+    assert "8%" in (result.reason or "")
+
+
+@pytest.mark.asyncio
+async def test_allows_first_entry_at_cap(sessionmaker):
+    """Sem posição existente da wallet, primeira entrada a 8% passa."""
+    guard = ExposureGuard(session_factory=sessionmaker)
+    market = make_snapshot(market_id="evt_y", outcome="YES")
+
+    result = await guard.check(
+        market=market,
+        size_usd=Decimal("80"),  # = 8% de 1000
+        bankroll_usd=Decimal("1000"),
+        followed_wallet="0xabc",
+        side=TradeSide.BUY,
+    )
+
+    assert result.passes
+
+
+@pytest.mark.asyncio
+async def test_position_cap_per_wallet_not_aggregate(sessionmaker):
+    """Wallet B pode entrar mesmo se wallet A já tem $80 no mesmo mercado.
+    O cap é por (wallet, market), não per-market global."""
+    pos_a = Position(
+        market_id="evt_x",
+        outcome="YES",
+        side=TradeSide.BUY,
+        status=PositionStatus.OPEN,
+        is_paper=True,
+        size_usd=Decimal("80"),
+        avg_entry_price=Decimal("0.40"),
+        entries_count=1,
+        opened_at=datetime.now(timezone.utc),
+        closed_at=None,
+        realized_pnl_usd=None,
+        followed_wallets=["0xaaa"],
+    )
+    await _add(sessionmaker, pos_a)
+
+    guard = ExposureGuard(session_factory=sessionmaker)
+    market = make_snapshot(market_id="evt_x", outcome="YES")
+
+    # Wallet B é diferente — passa o cap por posição (mas pode falhar
+    # noutros checks como event 15%, dependendo do volume).
+    result = await guard.check(
+        market=market,
+        size_usd=Decimal("50"),
+        bankroll_usd=Decimal("1000"),
+        followed_wallet="0xbbb",  # wallet diferente
+        side=TradeSide.BUY,
+    )
+    # O cap por posição passa (wallet B não tem nada), mas o event cap
+    # pode falhar (já tem $80 no evento + $50 = $130 = 13% < 15%, passa).
+    assert result.passes is True
+
+
+@pytest.mark.asyncio
 async def test_rejects_when_10_open_positions(sessionmaker):
     positions = [
         _open_pos(market_id=f"evt_{i}", size_usd="20") for i in range(10)

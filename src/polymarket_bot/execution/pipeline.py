@@ -173,12 +173,17 @@ class ExecutionPipeline:
                 depth=depth,
             )
 
-        # ---- 3. Exposure guard (15%/evento, cash reserve 30%, máx 10 abertas) ----
+        # ---- 3. Exposure guard (8%/posição, 15%/evento, cash 30%, máx 10) ----
         if self._exposure_guard is not None:
+            # Passa wallet_address para que o guard possa aplicar o cap por
+            # posição (evita pyramiding além de 8% via múltiplas entradas).
             exposure = await self._exposure_guard.check(
                 market=ctx.market,
                 size_usd=size_decision.final_size_usd,
                 bankroll_usd=ctx.bankroll_usd,
+                followed_wallet=ctx.signals[0].signal.wallet_address
+                if ctx.signals else None,
+                side=TradeSide.BUY,
             )
             if not exposure.passes:
                 log.info("skip: exposure — {}", exposure.reason)

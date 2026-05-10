@@ -1,10 +1,13 @@
-"""Gate de exposição aplicado antes do submit (CLAUDE.md §2, §8).
+"""Gate de exposição aplicado antes do submit.
 
-Três verificações sobre o estado actual das posições abertas:
+Verificações sobre o estado actual das posições abertas:
 
     1. Máx. 10 posições abertas simultâneas.
     2. Cash reserve ≥ 30% da banca após abrir a nova posição.
     3. Máx. 15% da banca por evento (condition_id partilhado YES/NO).
+    4. Máx. 8% da banca por **posição** (= ``(wallet, market, outcome, side)``).
+       Wallets que pyramidem deixam de poder crescer a posição além de 8% —
+       evita que 5 entradas pequenas componham uma posição de 30%+ da banca.
 
 Sem estado em memória — cada `check()` faz queries frescas à DB.
 """
@@ -17,13 +20,14 @@ from decimal import Decimal
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from polymarket_bot.db.enums import PositionStatus
+from polymarket_bot.db.enums import PositionStatus, TradeSide
 from polymarket_bot.db.models import Position
 from polymarket_bot.market.models import MarketSnapshot
 
 MAX_OPEN_POSITIONS = 10
 CASH_RESERVE_RATIO = Decimal("0.30")
 MAX_EVENT_EXPOSURE_RATIO = Decimal("0.15")
+MAX_POSITION_EXPOSURE_RATIO = Decimal("0.08")  # cap absoluto por posição
 EVENT_KEY_LEN = 42
 
 
@@ -54,11 +58,45 @@ class ExposureGuard:
         market: MarketSnapshot,
         size_usd: Decimal,
         bankroll_usd: Decimal,
+        followed_wallet: str | None = None,
+        side: TradeSide = TradeSide.BUY,
     ) -> ExposureCheckResult:
         async with self._sessionmaker() as session:
             open_positions = await self._open_positions(session)
 
         count = len(open_positions)
+
+        # Cap absoluto por posição (= 8% da banca por wallet+market+outcome+side).
+        # Antes uma wallet podia entrar 5x no mesmo mercado e cada entrada passava
+        # o cap de 8% individualmente, mas a posição agregada chegava a 30%+.
+        if followed_wallet is not None:
+            wallet_lower = followed_wallet.lower()
+            existing_size = sum(
+                (
+                    p.size_usd
+                    for p in open_positions
+                    if p.market_id == market.market_id
+                    and (p.outcome or "").upper() == (market.outcome or "").upper()
+                    and p.side == side
+                    and wallet_lower in {a.lower() for a in (p.followed_wallets or [])}
+                ),
+                start=Decimal("0"),
+            )
+            new_total = existing_size + size_usd
+            cap = bankroll_usd * MAX_POSITION_EXPOSURE_RATIO
+            if new_total > cap:
+                pct = float(new_total / bankroll_usd) if bankroll_usd > 0 else 0.0
+                return ExposureCheckResult(
+                    passes=False,
+                    reason=(
+                        f"posição já a 8% — entry adicional saltada "
+                        f"(existing=${float(existing_size):.2f} + new=${float(size_usd):.2f} "
+                        f"= {pct:.1%} > 8%)"
+                    ),
+                    open_positions=count,
+                    capital_deployed_pct=0.0,
+                    event_exposure_pct=None,
+                )
         total_deployed = sum(
             (p.size_usd for p in open_positions), start=Decimal("0")
         )
