@@ -85,6 +85,7 @@ async def _seed_open_position(
     *,
     size_usd: str = "50",
     avg_entry_price: str = "0.40",
+    sl_anchor_price: str | None = None,
     entries_count: int = 1,
     market_id: str = "m1",
     outcome: str = "YES",
@@ -101,6 +102,7 @@ async def _seed_open_position(
         is_paper=True,
         size_usd=Decimal(size_usd),
         avg_entry_price=Decimal(avg_entry_price),
+        sl_anchor_price=Decimal(sl_anchor_price) if sl_anchor_price else Decimal(avg_entry_price),
         entries_count=entries_count,
         opened_at=now - timedelta(hours=3),
         closed_at=None,
@@ -341,6 +343,50 @@ async def test_small_profit_does_not_trigger_partial(sessionmaker):
 
     assert result.skipped is True
     assert result.exit_reason is None
+
+
+@pytest.mark.asyncio
+async def test_sl_uses_anchor_not_avg_entry_after_average_down(sessionmaker):
+    """Wallet entrou primeiro a 0.60, depois adicionou a 0.40 → avg_entry=0.50.
+    Mas sl_anchor=0.60 (1ª entrada). SL trigger é 0.60×0.6=0.36, não 0.50×0.6=0.30.
+
+    Com mid 0.36 → trigger ratio = (0.36/0.60)−1 = −40% → SL fires.
+    Antes (sem anchor) avaliava 0.36/0.50−1 = −28% → não fires.
+    """
+    await _seed_open_position(
+        sessionmaker,
+        size_usd="100",
+        avg_entry_price="0.50",
+        sl_anchor_price="0.60",
+    )
+    snap = _snapshot(mid_price="0.36")
+    manager = _make_exit_manager(sessionmaker, snapshot=snap)
+
+    [result] = await manager.check_all_positions()
+
+    assert result.exit_reason == ExitReason.HARD_STOP_LOSS
+    manager._circuit_breaker.record_stop_loss.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_sl_anchor_falls_back_to_avg_entry_for_legacy(sessionmaker):
+    """Posição legacy sem sl_anchor_price (None) → usa avg_entry_price como
+    fallback. Comportamento igual ao antigo, sem regressão."""
+    pos = await _seed_open_position(
+        sessionmaker, size_usd="100", avg_entry_price="0.50"
+    )
+    # Força sl_anchor_price = None (= legacy)
+    async with sessionmaker() as s:
+        fresh = await s.get(Position, pos.id)
+        fresh.sl_anchor_price = None
+        await s.commit()
+
+    snap = _snapshot(mid_price="0.30")  # -40% sobre 0.50
+    manager = _make_exit_manager(sessionmaker, snapshot=snap)
+
+    [result] = await manager.check_all_positions()
+
+    assert result.exit_reason == ExitReason.HARD_STOP_LOSS
 
 
 @pytest.mark.asyncio

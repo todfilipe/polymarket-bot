@@ -115,6 +115,19 @@ async def main() -> None:
     )
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Migração ad-hoc: adiciona `sl_anchor_price` se ainda não existir.
+        # Backfilla legacy positions com avg_entry_price.
+        from sqlalchemy import text
+        cols = await conn.execute(text("PRAGMA table_info(positions)"))
+        col_names = {row[1] for row in cols.fetchall()}
+        if "sl_anchor_price" not in col_names:
+            await conn.execute(text(
+                "ALTER TABLE positions ADD COLUMN sl_anchor_price NUMERIC(10, 6)"
+            ))
+            await conn.execute(text(
+                "UPDATE positions SET sl_anchor_price = avg_entry_price "
+                "WHERE sl_anchor_price IS NULL"
+            ))
     sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
 
     http_session = aiohttp.ClientSession(

@@ -161,6 +161,7 @@ class ExitManager:
         if position.avg_entry_price <= 0:
             return _skipped(position, self._live_mode, "avg_entry_price inválido")
 
+        # PnL accounting (real, baseado no avg_entry).
         current_value = (
             position.size_usd * (current_price / position.avg_entry_price)
         )
@@ -169,14 +170,28 @@ class ExitManager:
             pnl_usd / position.size_usd if position.size_usd > 0 else Decimal("0")
         )
 
+        # SL trigger ratio — relativo ao SL anchor (= preço da 1ª entrada),
+        # não ao avg_entry. Assim averaging-down não desce o gatilho do SL.
+        # Backwards-compatible: posições sem sl_anchor usam avg_entry como
+        # aproximação.
+        sl_anchor = position.sl_anchor_price or position.avg_entry_price
+        sl_trigger_ratio = (
+            (current_price / sl_anchor) - Decimal("1")
+            if sl_anchor and sl_anchor > 0
+            else Decimal("0")
+        )
+
         log = log.bind(
             current_price=str(current_price),
             pnl_usd=str(pnl_usd),
             pnl_ratio=f"{float(pnl_ratio):.3f}",
+            sl_trigger_ratio=f"{float(sl_trigger_ratio):.3f}",
+            sl_anchor=str(sl_anchor),
         )
 
-        # 1) Hard stop loss — prioridade absoluta.
-        if pnl_ratio <= HARD_STOP_LOSS_RATIO:
+        # 1) Hard stop loss — prioridade absoluta. Compara contra o anchor
+        # da 1ª entrada (não avg_entry) — gatilho fixo, não desce com adds.
+        if sl_trigger_ratio <= HARD_STOP_LOSS_RATIO:
             log.bind(exit_reason=ExitReason.HARD_STOP_LOSS.value).warning(
                 "exit: hard stop loss accionado"
             )
@@ -184,7 +199,7 @@ class ExitManager:
                 position, ExitReason.HARD_STOP_LOSS, current_price, pnl_usd
             )
             if not result.skipped:
-                await self._after_stop_loss(pnl_ratio)
+                await self._after_stop_loss(sl_trigger_ratio)
             return result
 
         # 2) Take profit parcial — dispara quando o lucro REALIZÁVEL atinge o

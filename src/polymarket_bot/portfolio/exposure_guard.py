@@ -24,7 +24,7 @@ from polymarket_bot.db.enums import PositionStatus, TradeSide
 from polymarket_bot.db.models import Position
 from polymarket_bot.market.models import MarketSnapshot
 
-MAX_OPEN_POSITIONS = 10
+MAX_OPEN_POSITIONS = 30
 CASH_RESERVE_RATIO = Decimal("0.30")
 MAX_EVENT_EXPOSURE_RATIO = Decimal("0.15")
 MAX_POSITION_EXPOSURE_RATIO = Decimal("0.08")  # cap absoluto por posição
@@ -120,7 +120,7 @@ class ExposureGuard:
         if count >= MAX_OPEN_POSITIONS:
             return ExposureCheckResult(
                 passes=False,
-                reason="máx. 10 posições abertas atingido",
+                reason=f"máx. {MAX_OPEN_POSITIONS} posições abertas atingido",
                 open_positions=count,
                 capital_deployed_pct=deployed_pct,
                 event_exposure_pct=event_pct_current,

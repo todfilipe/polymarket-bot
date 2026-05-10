@@ -96,10 +96,10 @@ class TestPipelineHappyPath:
         call = om.calls[0]
         assert call["outcome"] == "YES"
         assert call["side"] == TradeSide.BUY
-        # pre_cap = 50 × 1.4 × 1.3 = $91 → excede cap 8% ($80), logo capped
-        assert call["size_usd"] == Decimal("80.00")
+        # pre_cap = 30 × 1.4 × 1.3 = $54.60 → < cap 8% ($80), não capped
+        assert call["size_usd"] == pytest.approx(Decimal("54.60"), abs=Decimal("0.01"))
         assert result.size is not None
-        assert result.size.hit_cap
+        assert not result.size.hit_cap
         assert call["followed_wallet"] == "0xA"
         assert call["dedup_hash"] == result.dedup_hash
         assert call["dedup_hash"] is not None
@@ -149,12 +149,13 @@ class TestPipelineSkips:
 
     @pytest.mark.asyncio
     async def test_skipped_size_low_bankroll_solo_bottom(self):
-        """Banca $100 + SOLO BOTTOM + win rate alto → falha no sizing."""
+        """Com mínimo $1, só fica abaixo com banca muito baixa.
+        Banca $30 + SOLO BOTTOM = 0.9 × 0.7 × 0.5 = $0.315 → skip."""
         om = FakeOrderManager()
         pipeline = ExecutionPipeline(order_manager=om)
         ctx = _ctx(
             [_signal_input("0xA", WalletTier.BOTTOM, "YES", 0.80)],
-            bankroll=Decimal("100"),
+            bankroll=Decimal("30"),
         )
 
         result = await pipeline.evaluate(ctx)

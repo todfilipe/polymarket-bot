@@ -15,10 +15,10 @@ class StrategyConstants:
     WEEKLY_STOP_LOSS: float = -0.15
     CASH_RESERVE_RATIO: float = 0.30
 
-    # --- Sizing (§4.2, §7.1) ---
-    BASE_SIZE_RATIO: float = 0.05
-    MAX_SIZE_RATIO: float = 0.08
-    MIN_TRADE_USD: float = 20.0
+    # --- Sizing ---
+    BASE_SIZE_RATIO: float = 0.03   # base 3% da banca por trade (era 5%)
+    MAX_SIZE_RATIO: float = 0.08    # cap absoluto por posição
+    MIN_TRADE_USD: float = 1.0      # mínimo CLOB ~$1 (era $20)
 
     # Multiplicadores de sizing
     TIER_TOP_MULTIPLIER: float = 1.4
@@ -33,7 +33,7 @@ class StrategyConstants:
     MAX_RATIO_PER_CATEGORY: float = 0.25
     MAX_RATIO_PER_EVENT: float = 0.15
     MAX_RATIO_TOP3_COMBINED: float = 0.50
-    MAX_OPEN_POSITIONS: int = 10
+    MAX_OPEN_POSITIONS: int = 30   # era 10; cash reserve já actua como backstop real
 
     # --- Wallets seguidas (§2.1) ---
     WALLETS_FOLLOWED: int = 7

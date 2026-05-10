@@ -244,6 +244,9 @@ class OrderManager:
                 is_paper=not self.is_live,
                 size_usd=size_usd,
                 avg_entry_price=executed_price,
+                # Anchor do stop loss FIXO no preço da 1ª entrada — não desce
+                # com averaging-down em entries seguintes.
+                sl_anchor_price=executed_price,
                 entries_count=1,
                 opened_at=datetime.now(timezone.utc),
                 closed_at=None,
@@ -255,6 +258,8 @@ class OrderManager:
             return
 
         # Mesma wallet, re-entrada no mesmo mercado → agrega.
+        # `avg_entry_price` actualiza (accounting); `sl_anchor_price` NÃO —
+        # mantém o gatilho do SL no preço da 1ª entrada.
         new_size = existing.size_usd + size_usd
         if new_size > 0:
             existing.avg_entry_price = (
@@ -265,6 +270,9 @@ class OrderManager:
         existing.entries_count = existing.entries_count + 1
         if existing.status == PositionStatus.PARTIALLY_CLOSED:
             existing.status = PositionStatus.OPEN
+        # Backfill defensivo: se for posição legacy sem sl_anchor, usa o avg actual.
+        if existing.sl_anchor_price is None:
+            existing.sl_anchor_price = existing.avg_entry_price
 
     # ------------------------------------------------------------------
     # Rotas de submissão — separadas para clareza e testabilidade.

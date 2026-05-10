@@ -48,6 +48,26 @@ async def session_scope() -> AsyncIterator[AsyncSession]:
 
 
 async def init_db() -> None:
-    """Cria tabelas se não existirem. Para dev — em prod usar Alembic."""
+    """Cria tabelas se não existirem + aplica migrações ad-hoc.
+
+    Para dev — em prod usar Alembic. Migrações idempotentes (verificam se a
+    coluna já existe via ``PRAGMA table_info``).
+    """
+    from sqlalchemy import text  # local — usado só aqui
+
     async with get_engine().begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+        # Migração: adicionar `sl_anchor_price` à tabela `positions` se ainda
+        # não existir. Backfilla com `avg_entry_price` para posições legacy
+        # (mantém SL trigger funcional, embora aproximado).
+        cols = await conn.execute(text("PRAGMA table_info(positions)"))
+        col_names = {row[1] for row in cols.fetchall()}
+        if "sl_anchor_price" not in col_names:
+            await conn.execute(text(
+                "ALTER TABLE positions ADD COLUMN sl_anchor_price NUMERIC(10, 6)"
+            ))
+            await conn.execute(text(
+                "UPDATE positions SET sl_anchor_price = avg_entry_price "
+                "WHERE sl_anchor_price IS NULL"
+            ))

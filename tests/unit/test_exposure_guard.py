@@ -173,9 +173,10 @@ async def test_position_cap_per_wallet_not_aggregate(sessionmaker):
 
 
 @pytest.mark.asyncio
-async def test_rejects_when_10_open_positions(sessionmaker):
+async def test_rejects_when_30_open_positions(sessionmaker):
+    """Cap subiu para 30 — 30 posições abertas bloqueiam novas entradas."""
     positions = [
-        _open_pos(market_id=f"evt_{i}", size_usd="20") for i in range(10)
+        _open_pos(market_id=f"evt_{i}", size_usd="5") for i in range(30)
     ]
     await _add(sessionmaker, *positions)
 
@@ -183,12 +184,12 @@ async def test_rejects_when_10_open_positions(sessionmaker):
     market = make_snapshot(market_id="evt_new")
 
     result = await guard.check(
-        market=market, size_usd=Decimal("20"), bankroll_usd=Decimal("1000")
+        market=market, size_usd=Decimal("5"), bankroll_usd=Decimal("1000")
     )
 
     assert not result.passes
-    assert "máx. 10 posições abertas" in (result.reason or "")
-    assert result.open_positions == 10
+    assert "30 posições" in (result.reason or "")
+    assert result.open_positions == 30
 
 
 @pytest.mark.asyncio
@@ -382,9 +383,10 @@ async def test_pipeline_none_guard_passes_through(sessionmaker):
 
 @pytest.mark.asyncio
 async def test_pipeline_skipped_exposure_when_guard_rejects(sessionmaker):
+    """Cap actual = 30 posições. Bate quando há 30 abertas."""
     await _add(
         sessionmaker,
-        *[_open_pos(market_id=f"e{i}", size_usd="20") for i in range(10)],
+        *[_open_pos(market_id=f"e{i}", size_usd="5") for i in range(30)],
     )
     guard = ExposureGuard(session_factory=sessionmaker)
     om = FakeOrderManager()
@@ -399,5 +401,5 @@ async def test_pipeline_skipped_exposure_when_guard_rejects(sessionmaker):
     result = await pipeline.evaluate(ctx)
 
     assert result.outcome == PipelineOutcome.SKIPPED_EXPOSURE
-    assert "10 posições" in (result.reason or "")
+    assert "30 posições" in (result.reason or "")
     assert om.calls == []

@@ -180,6 +180,14 @@ class Position(Base, TimestampMixin):
 
     size_usd: Mapped[Decimal] = mapped_column(Numeric(18, 6), nullable=False)
     avg_entry_price: Mapped[Decimal] = mapped_column(Numeric(10, 6), nullable=False)
+    # Preço da PRIMEIRA entrada — fixo. Usado como ponto-âncora para o stop loss.
+    # ``avg_entry_price`` continua a actualizar com cada add (accounting), mas
+    # o SL dispara sempre relativo a este — não desce com averaging-down.
+    # ``None`` em posições legacy (anteriores ao field), nas quais cai no
+    # ``avg_entry_price`` como aproximação.
+    sl_anchor_price: Mapped[Decimal | None] = mapped_column(
+        Numeric(10, 6), nullable=True
+    )
     entries_count: Mapped[int] = mapped_column(Integer, default=1)
 
     opened_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
