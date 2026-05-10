@@ -132,11 +132,9 @@ def _make_exit_manager(
     market_builder.get_resolution_status = AsyncMock(return_value=resolution)
 
     cb = circuit_breaker or MagicMock()
-    cb.record_stop_loss = AsyncMock()
     cb.get_status = AsyncMock(return_value=CircuitBreakerStatus.NORMAL)
 
     notif = notifier or MagicMock()
-    notif.stop_loss_triggered = AsyncMock()
     notif.critical_error = AsyncMock()
     notif.send = AsyncMock()
 
@@ -163,30 +161,6 @@ async def test_no_open_positions_returns_empty_list(sessionmaker):
 
 
 @pytest.mark.asyncio
-async def test_hard_stop_loss_at_minus_41pct_closes_full(sessionmaker):
-    # avg_entry=0.50, current=0.295 → razão ≈ -41%
-    await _seed_open_position(
-        sessionmaker, size_usd="100", avg_entry_price="0.50"
-    )
-    snap = _snapshot(mid_price="0.295")
-    manager = _make_exit_manager(sessionmaker, snapshot=snap)
-
-    [result] = await manager.check_all_positions()
-
-    assert result.exit_reason == ExitReason.HARD_STOP_LOSS
-    assert result.skipped is False
-    assert result.pnl_usd < 0
-    manager._circuit_breaker.record_stop_loss.assert_awaited_once()
-    manager._notifier.stop_loss_triggered.assert_awaited_once()
-
-    async with sessionmaker() as s:
-        fresh = await s.get(Position, result.position_id)
-        assert fresh.status == PositionStatus.CLOSED
-        assert fresh.realized_pnl_usd is not None
-        assert fresh.notes == ExitReason.HARD_STOP_LOSS.value
-
-
-@pytest.mark.asyncio
 async def test_resolved_win_credits_correct_pnl(sessionmaker):
     """Mercado resolveu YES e a posição era YES → fecha com P&L positivo
     proporcional ao entry price. Em paper, $100 a 0.40 → resolve a $1 → +$150."""
@@ -204,8 +178,6 @@ async def test_resolved_win_credits_correct_pnl(sessionmaker):
     assert result.skipped is False
     # P&L = size × (1/entry - 1) = 100 × (1/0.40 - 1) = 100 × 1.5 = 150
     assert result.pnl_usd == Decimal("150")
-    # Não deve registar como stop loss (não é panic exit)
-    manager._circuit_breaker.record_stop_loss.assert_not_awaited()
 
     async with sessionmaker() as s:
         fresh = await s.get(Position, result.position_id)
@@ -229,8 +201,6 @@ async def test_resolved_loss_records_full_size_loss(sessionmaker):
 
     assert result.exit_reason == ExitReason.RESOLVED_LOSS
     assert result.pnl_usd == Decimal("-100")
-    # Não deve disparar circuit breaker — resolução natural ≠ stop loss
-    manager._circuit_breaker.record_stop_loss.assert_not_awaited()
 
     async with sessionmaker() as s:
         fresh = await s.get(Position, result.position_id)
@@ -257,19 +227,19 @@ async def test_unresolved_market_falls_through_to_normal_checks(sessionmaker):
 
 
 @pytest.mark.asyncio
-async def test_pnl_at_minus_39pct_does_not_exit(sessionmaker):
-    # avg_entry=0.50, current=0.305 → razão ≈ -39%
+async def test_large_loss_does_not_exit_pure_copy(sessionmaker):
+    """Sem hard stop loss: mesmo uma perda de -50% (ou pior) não fecha a posição.
+    A wallet decide quando sair; o cap por posição (10%) é o backstop real."""
     await _seed_open_position(
         sessionmaker, size_usd="100", avg_entry_price="0.50"
     )
-    snap = _snapshot(mid_price="0.305")
+    snap = _snapshot(mid_price="0.25")  # -50% → antes disparava SL
     manager = _make_exit_manager(sessionmaker, snapshot=snap)
 
     [result] = await manager.check_all_positions()
 
     assert result.skipped is True
     assert result.exit_reason is None
-    manager._circuit_breaker.record_stop_loss.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -306,50 +276,6 @@ async def test_small_profit_lets_run(sessionmaker):
 
     assert result.skipped is True
     assert result.exit_reason is None
-
-
-@pytest.mark.asyncio
-async def test_sl_uses_anchor_not_avg_entry_after_average_down(sessionmaker):
-    """Wallet entrou primeiro a 0.60, depois adicionou a 0.40 → avg_entry=0.50.
-    Mas sl_anchor=0.60 (1ª entrada). SL trigger é 0.60×0.6=0.36, não 0.50×0.6=0.30.
-
-    Com mid 0.36 → trigger ratio = (0.36/0.60)−1 = −40% → SL fires.
-    Antes (sem anchor) avaliava 0.36/0.50−1 = −28% → não fires.
-    """
-    await _seed_open_position(
-        sessionmaker,
-        size_usd="100",
-        avg_entry_price="0.50",
-        sl_anchor_price="0.60",
-    )
-    snap = _snapshot(mid_price="0.36")
-    manager = _make_exit_manager(sessionmaker, snapshot=snap)
-
-    [result] = await manager.check_all_positions()
-
-    assert result.exit_reason == ExitReason.HARD_STOP_LOSS
-    manager._circuit_breaker.record_stop_loss.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_sl_anchor_falls_back_to_avg_entry_for_legacy(sessionmaker):
-    """Posição legacy sem sl_anchor_price (None) → usa avg_entry_price como
-    fallback. Comportamento igual ao antigo, sem regressão."""
-    pos = await _seed_open_position(
-        sessionmaker, size_usd="100", avg_entry_price="0.50"
-    )
-    # Força sl_anchor_price = None (= legacy)
-    async with sessionmaker() as s:
-        fresh = await s.get(Position, pos.id)
-        fresh.sl_anchor_price = None
-        await s.commit()
-
-    snap = _snapshot(mid_price="0.30")  # -40% sobre 0.50
-    manager = _make_exit_manager(sessionmaker, snapshot=snap)
-
-    [result] = await manager.check_all_positions()
-
-    assert result.exit_reason == ExitReason.HARD_STOP_LOSS
 
 
 @pytest.mark.asyncio
@@ -416,59 +342,29 @@ async def test_wallet_exit_follows_regardless_of_timing_skill(
 
 
 @pytest.mark.asyncio
-async def test_hard_stop_loss_takes_priority_over_take_profit(sessionmaker):
-    """Impossível na prática (mid≥0.80 E pnl_ratio ≤ -40% requerem entry>1.33),
-    mas verificamos a hierarquia forçando o cenário via avg_entry alto."""
+async def test_wallet_exit_idempotent_after_close(sessionmaker, monkeypatch):
+    """Após wallet_exit fechar a posição, segunda chamada não a reabre."""
     await _seed_open_position(
-        sessionmaker, size_usd="100", avg_entry_price="1.5"  # entry acima do range
+        sessionmaker,
+        size_usd="100",
+        avg_entry_price="0.40",
+        followed_wallets=["0xabc"],
     )
-    # current 0.80 vs entry 1.5 → ratio ≈ -47%.
-    snap = _snapshot(mid_price="0.80")
+    snap = _snapshot(mid_price="0.42", hours_to_resolution=48.0)
     manager = _make_exit_manager(sessionmaker, snapshot=snap)
 
-    [result] = await manager.check_all_positions()
+    async def _detect(position):
+        return [WalletExitCandidate(wallet_address="0xabc", timing_skill_ratio=0.65)]
 
-    assert result.exit_reason == ExitReason.HARD_STOP_LOSS
-    manager._circuit_breaker.record_stop_loss.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_check_all_positions_is_idempotent(sessionmaker):
-    await _seed_open_position(
-        sessionmaker, size_usd="100", avg_entry_price="0.50"
-    )
-    snap = _snapshot(mid_price="0.295")  # stop loss
-    manager = _make_exit_manager(sessionmaker, snapshot=snap)
+    monkeypatch.setattr(manager, "_detect_wallet_exits", _detect)
 
     first = await manager.check_all_positions()
     second = await manager.check_all_positions()
 
     assert len(first) == 1
-    assert first[0].exit_reason == ExitReason.HARD_STOP_LOSS
+    assert first[0].exit_reason == ExitReason.WALLET_EXIT
     # Na segunda chamada a posição já não está OPEN — não aparece.
     assert second == []
-    manager._circuit_breaker.record_stop_loss.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_live_mode_stub_marks_pending_manual(sessionmaker):
-    pos = await _seed_open_position(
-        sessionmaker, size_usd="100", avg_entry_price="0.50"
-    )
-    snap = _snapshot(mid_price="0.295")
-    manager = _make_exit_manager(sessionmaker, snapshot=snap, live_mode=True)
-
-    [result] = await manager.check_all_positions()
-
-    assert result.skipped is True
-    assert "live exit" in (result.skip_reason or "")
-    manager._notifier.critical_error.assert_awaited_once()
-
-    async with sessionmaker() as s:
-        fresh = await s.get(Position, pos.id)
-        # Posição NÃO foi fechada — fail-safe.
-        assert fresh.status == PositionStatus.OPEN
-        assert fresh.notes == "exit_pending_manual"
 
 
 @pytest.mark.asyncio
@@ -503,13 +399,12 @@ def _make_live_exit_manager(sm, *, snapshot, clob_client) -> ExitManager:
     """Construtor focado para testes live — factory devolve o clob mockado."""
     market_builder = MagicMock()
     market_builder.build = AsyncMock(return_value=snapshot)
+    market_builder.get_resolution_status = AsyncMock(return_value=(False, None))
 
     cb = MagicMock()
-    cb.record_stop_loss = AsyncMock()
     cb.get_status = AsyncMock(return_value=CircuitBreakerStatus.NORMAL)
 
     notif = MagicMock()
-    notif.stop_loss_triggered = AsyncMock()
     notif.critical_error = AsyncMock()
     notif.send = AsyncMock()
 
@@ -523,15 +418,28 @@ def _make_live_exit_manager(sm, *, snapshot, clob_client) -> ExitManager:
     )
 
 
+def _wallet_exit_detector(wallet_address: str = "0xabc"):
+    """Helper para forçar wallet_exit trigger em testes live."""
+    async def _detect(_position):
+        return [
+            WalletExitCandidate(wallet_address=wallet_address, timing_skill_ratio=0.7)
+        ]
+    return _detect
+
+
 @pytest.mark.asyncio
 async def test_live_sell_success_closes_position_with_pnl(
-    sessionmaker, fast_poll_exit
+    sessionmaker, fast_poll_exit, monkeypatch
 ):
-    """Hard stop loss em live mode → SELL submetida e `FILLED` no primeiro poll."""
+    """Wallet exit em live mode → SELL submetida e `FILLED` no primeiro poll."""
     pos = await _seed_open_position(
-        sessionmaker, size_usd="100", avg_entry_price="0.50", token_id="tok-xyz"
+        sessionmaker,
+        size_usd="100",
+        avg_entry_price="0.50",
+        followed_wallets=["0xabc"],
+        token_id="tok-xyz",
     )
-    snap = _snapshot(mid_price="0.295")  # razão ≈ -41% → hard SL
+    snap = _snapshot(mid_price="0.45")  # pequena perda, mas wallet_exit dispara
 
     clob = MagicMock()
     clob.create_order = MagicMock(return_value={"signed": True})
@@ -542,11 +450,11 @@ async def test_live_sell_success_closes_position_with_pnl(
     clob.cancel = MagicMock()
 
     manager = _make_live_exit_manager(sessionmaker, snapshot=snap, clob_client=clob)
+    monkeypatch.setattr(manager, "_detect_wallet_exits", _wallet_exit_detector())
     [result] = await manager.check_all_positions()
 
-    assert result.exit_reason == ExitReason.HARD_STOP_LOSS
+    assert result.exit_reason == ExitReason.WALLET_EXIT
     assert result.skipped is False
-    assert result.pnl_usd < 0
     clob.create_order.assert_called_once()
     clob.post_order.assert_called_once()
     clob.cancel.assert_not_called()
@@ -555,18 +463,22 @@ async def test_live_sell_success_closes_position_with_pnl(
         fresh = await s.get(Position, pos.id)
         assert fresh.status == PositionStatus.CLOSED
         assert fresh.realized_pnl_usd == result.pnl_usd
-        assert fresh.notes == ExitReason.HARD_STOP_LOSS.value
+        assert fresh.notes == ExitReason.WALLET_EXIT.value
 
 
 @pytest.mark.asyncio
 async def test_live_sell_timeout_marks_pending_manual_and_alerts(
-    sessionmaker, fast_poll_exit
+    sessionmaker, fast_poll_exit, monkeypatch
 ):
     """60s sem FILLED → cancel + `exit_pending_manual` + alerta Telegram."""
     pos = await _seed_open_position(
-        sessionmaker, size_usd="100", avg_entry_price="0.50", token_id="tok-xyz"
+        sessionmaker,
+        size_usd="100",
+        avg_entry_price="0.50",
+        followed_wallets=["0xabc"],
+        token_id="tok-xyz",
     )
-    snap = _snapshot(mid_price="0.295")
+    snap = _snapshot(mid_price="0.45")
 
     clob = MagicMock()
     clob.create_order = MagicMock(return_value={"signed": True})
@@ -577,6 +489,7 @@ async def test_live_sell_timeout_marks_pending_manual_and_alerts(
     clob.cancel = MagicMock()
 
     manager = _make_live_exit_manager(sessionmaker, snapshot=snap, clob_client=clob)
+    monkeypatch.setattr(manager, "_detect_wallet_exits", _wallet_exit_detector())
     [result] = await manager.check_all_positions()
 
     assert result.skipped is True

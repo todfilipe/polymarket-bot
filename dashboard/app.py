@@ -475,8 +475,6 @@ async def api_positions() -> dict[str, Any]:
     now = datetime.now(timezone.utc)
     for p, meta in zip(rows, metas):
         entry = _to_float(p.avg_entry_price)
-        # SL ancorado na 1ª entrada; cai em avg_entry_price para posições legacy.
-        sl_anchor = _to_float(p.sl_anchor_price) if p.sl_anchor_price is not None else entry
         size = _to_float(p.size_usd)
         opened_at = p.opened_at
         if opened_at and opened_at.tzinfo is None:
@@ -488,14 +486,6 @@ async def api_positions() -> dict[str, Any]:
         if current_price is not None and entry > 0:
             pnl_pct = (current_price - entry) / entry
             pnl_usd = pnl_pct * size
-
-        # Hard stop: -40% do SL anchor (1ª entrada). Não desce com averaging-down.
-        stop_price = sl_anchor * (1 + CONST.HARD_STOP_LOSS_PER_POSITION)
-        near_stop = (
-            current_price is not None
-            and sl_anchor > 0
-            and current_price <= stop_price * 1.10
-        )
 
         # Meta do Gamma tem prioridade; cai em Market do DB se existir.
         db_market = markets_map.get(p.market_id)
@@ -520,14 +510,11 @@ async def api_positions() -> dict[str, Any]:
                 "side": p.side.value,
                 "is_paper": p.is_paper,
                 "avg_entry_price": entry,
-                "sl_anchor_price": sl_anchor,
                 "entries_count": int(p.entries_count or 1),
                 "size_usd": size,
                 "current_price": current_price,
                 "pnl_usd": round(pnl_usd, 2) if pnl_usd is not None else None,
                 "pnl_pct": round(100 * pnl_pct, 2) if pnl_pct is not None else None,
-                "stop_price": round(stop_price, 4),
-                "near_stop": near_stop,
                 "followed_wallets": followed,
                 "followed_wallets_short": [w[:6] for w in followed],
                 "opened_at": _iso(opened_at),

@@ -546,13 +546,12 @@
               <th class="nowrap">Tamanho</th>
               <th class="nowrap">Preço atual</th>
               <th class="nowrap">P&amp;L</th>
-              <th class="nowrap">Stop</th>
               <th>Wallets</th>
               <th class="nowrap">Aberta há</th>
             </tr>
           </thead>
           <tbody id="positions-body">
-            <tr class="empty-row"><td colspan="9">A carregar…</td></tr>
+            <tr class="empty-row"><td colspan="8">A carregar…</td></tr>
           </tbody>
         </table>
       </div>
@@ -891,11 +890,6 @@
             p.pnl_usd === null
               ? 'N/A'
               : `${fmtMoney(p.pnl_usd)} <span class="text-muted">(${fmtPct(p.pnl_pct, true)})</span>`;
-          const stopCls = p.near_stop ? 'text-red' : 'text-muted';
-          // Stop title indica que está ancorado na 1ª entrada (sl_anchor)
-          const stopTitle = p.sl_anchor_price && p.entries_count > 1
-            ? `Ancorado na 1ª entrada @ ${fmtPrice(p.sl_anchor_price)}`
-            : 'Stop a -40% da entrada';
           const wallets = (p.followed_wallets_short || [])
             .map((w) => `<code>${escapeHtml(w)}</code>`)
             .join(' ');
@@ -906,7 +900,6 @@
             <td class="nowrap">${fmtMoney(p.size_usd)}</td>
             <td class="nowrap">${p.current_price === null ? '<span class="text-muted">N/A</span>' : fmtPrice(p.current_price)}</td>
             <td class="nowrap ${pnlClass}">${pnlTxt}</td>
-            <td class="nowrap ${stopCls}" title="${escapeHtml(stopTitle)}">${fmtPrice(p.stop_price)}</td>
             <td>${wallets || '<span class="text-muted">—</span>'}</td>
             <td class="nowrap text-muted" title="${escapeHtml(fmtClock(p.opened_at))}">${relativeTime(p.opened_at)}</td>
           </tr>`;

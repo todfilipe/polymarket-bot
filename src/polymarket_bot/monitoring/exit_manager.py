@@ -54,13 +54,20 @@ class LiveExitError(Exception):
     O caller marca a posição como `exit_pending_manual` e notifica humano.
     """
 
-HARD_STOP_LOSS_RATIO = Decimal(str(CONST.HARD_STOP_LOSS_PER_POSITION))
-
 _NOTE_EXIT_PENDING_MANUAL = "exit_pending_manual"
 
 
 class ExitReason(StrEnum):
-    HARD_STOP_LOSS = "HARD_STOP_LOSS"
+    """Razões válidas de saída.
+
+    Hard stop loss foi removido — pure copy puro: confiamos na wallet
+    para entrar, confiamos para sair. O cap de exposição (CONST.MAX_SIZE_RATIO,
+    10%) é o backstop real contra ruína. Em prediction markets binários,
+    eventos discretos (golos, news flashes) movem o preço 30-50% num minuto
+    e revertem com igual rapidez — um SL fixo desfaz trades em curso sem
+    proteger de catástrofe verdadeira (preço a 0 = evento já se decidiu).
+    """
+
     WALLET_EXIT = "WALLET_EXIT"
     RESOLVED_WIN = "RESOLVED_WIN"
     RESOLVED_LOSS = "RESOLVED_LOSS"
@@ -157,7 +164,8 @@ class ExitManager:
         if position.avg_entry_price <= 0:
             return _skipped(position, self._live_mode, "avg_entry_price inválido")
 
-        # PnL accounting (real, baseado no avg_entry).
+        # PnL accounting (real, baseado no avg_entry) — só para logs/auditoria.
+        # Sem hard stop loss: a única saída pré-resolução é wallet exit.
         current_value = (
             position.size_usd * (current_price / position.avg_entry_price)
         )
@@ -166,39 +174,13 @@ class ExitManager:
             pnl_usd / position.size_usd if position.size_usd > 0 else Decimal("0")
         )
 
-        # SL trigger ratio — relativo ao SL anchor (= preço da 1ª entrada),
-        # não ao avg_entry. Assim averaging-down não desce o gatilho do SL.
-        # Backwards-compatible: posições sem sl_anchor usam avg_entry como
-        # aproximação.
-        sl_anchor = position.sl_anchor_price or position.avg_entry_price
-        sl_trigger_ratio = (
-            (current_price / sl_anchor) - Decimal("1")
-            if sl_anchor and sl_anchor > 0
-            else Decimal("0")
-        )
-
         log = log.bind(
             current_price=str(current_price),
             pnl_usd=str(pnl_usd),
             pnl_ratio=f"{float(pnl_ratio):.3f}",
-            sl_trigger_ratio=f"{float(sl_trigger_ratio):.3f}",
-            sl_anchor=str(sl_anchor),
         )
 
-        # 1) Hard stop loss — prioridade absoluta. Compara contra o anchor
-        # da 1ª entrada (não avg_entry) — gatilho fixo, não desce com adds.
-        if sl_trigger_ratio <= HARD_STOP_LOSS_RATIO:
-            log.bind(exit_reason=ExitReason.HARD_STOP_LOSS.value).warning(
-                "exit: hard stop loss accionado"
-            )
-            result = await self._close_full(
-                position, ExitReason.HARD_STOP_LOSS, current_price, pnl_usd
-            )
-            if not result.skipped:
-                await self._after_stop_loss(sl_trigger_ratio)
-            return result
-
-        # 2) Wallet exit — segue sempre que a wallet que originou esta position
+        # Wallet exit — segue sempre que a wallet que originou esta position
         # vende. Como cada Position é per-wallet (upsert scoped por wallet em
         # `OrderManager._upsert_open_position`), `_detect_wallet_exits` só
         # devolve a wallet desta position. Sem threshold de skill: confiamos
@@ -401,19 +383,6 @@ class ExitManager:
         )
 
     # ------------------------------------------------------------------ hooks
-    async def _after_stop_loss(self, pnl_ratio: Decimal) -> None:
-        try:
-            await self._circuit_breaker.record_stop_loss()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("exit_manager: circuit_breaker falhou — {}", exc)
-        try:
-            await self._notifier.stop_loss_triggered(
-                reason="hard stop loss por posição",
-                pnl_pct=float(pnl_ratio),
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("exit_manager: notifier stop_loss falhou — {}", exc)
-
     async def _try_settle_resolved(
         self, position: Position, log: Any
     ) -> ExitResult | None:
@@ -468,10 +437,7 @@ class ExitManager:
         pnl_usd: Decimal,
         current_price: Decimal,
     ) -> None:
-        """Notificação best-effort sobre exits que NÃO sejam stop loss (esse é
-        notificado em `_after_stop_loss` com detalhe)."""
-        if reason == ExitReason.HARD_STOP_LOSS:
-            return
+        """Notificação best-effort sobre todos os exits."""
         mode = "LIVE" if self._live_mode else "PAPER"
         msg = (
             f"🔚 exit {reason.value} [{mode}] pos={position.id} "

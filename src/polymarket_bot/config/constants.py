@@ -87,12 +87,13 @@ class StrategyConstants:
     ORDER_EXECUTION_WINDOW_SECONDS: int = 60
 
     # --- Saídas ---
-    HARD_STOP_LOSS_PER_POSITION: float = -0.40
-    # Take profit parcial removido: incoerente com pure copy. A wallet decide
-    # quando sair (wallet exit), o SL ancorado a -40% é o backstop, e o
-    # auto-settle trata da resolução. Ir até ao fim em vez de colher metade
-    # ao chegar a +50% — em prediction markets, EV positivo está em deixar
-    # correr até resolução.
+    # Hard stop loss removido: incoerente com pure copy. A wallet decide quando
+    # sair (wallet exit); o cap por posição (MAX_SIZE_RATIO=10%) é o backstop
+    # contra ruína da banca; o auto-settle trata da resolução. Em prediction
+    # markets binários, eventos discretos (golos, news) movem o preço 30-50%
+    # num minuto e revertem com igual rapidez — um SL fixo desfaz trades em
+    # curso sem proteger de catástrofe verdadeira.
+    # Take profit parcial também removido pela mesma razão (ir até ao fim).
     MIN_WALLET_TIMING_SKILL: float = 0.60
 
     # --- Adições (§5.1) ---

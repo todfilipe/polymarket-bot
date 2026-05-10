@@ -2,12 +2,13 @@
 
 Transições suportadas:
 
-    NORMAL            →  PAUSED    weekly P&L ≤ −15%  (retoma próx. domingo 23:30)
-    NORMAL/PAUSED     →  RECOVERY  2 stop losses consecutivos (sizing ×0.6 no sizer)
+    NORMAL/PAUSED     →  PAUSED    weekly P&L ≤ −15%  (retoma próx. domingo)
     *                 →  HALTED    3 semanas negativas consecutivas
     HALTED/PAUSED     →  NORMAL    `resume_if_due()` com `resumes_at` expirado
-    Qualquer win      →  reset do contador de losses consecutivos (e, se estava em
-                                   RECOVERY apenas por losses, volta para NORMAL)
+
+O hard stop loss por posição foi removido (pure copy) → RECOVERY-via-SLs
+deixou de existir. O sizer continua a respeitar `size_reduction_factor` da
+linha actual, que é sempre 1.0 a não ser que seja explicitamente reduzido.
 
 A leitura do estado fica no `WalletMonitor` / `PortfolioManager`; este módulo é
 o único ponto de ESCRITA, garantindo invariantes:
@@ -15,32 +16,23 @@ o único ponto de ESCRITA, garantindo invariantes:
 - Idempotência: se já HALTED, nova chamada a `check_and_trigger` não cria linha.
 - Cada transição origina uma nova linha em `circuit_breaker_state` (historial).
 - `consecutive_negative_weeks` é propagado de uma linha para a seguinte.
-- `consecutive_stop_losses` não tem coluna dedicada — é derivado de `Position`
-  fechadas após o último reset (ver `_count_consecutive_stop_losses`).
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
 
 from loguru import logger
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from polymarket_bot.config.constants import CONST
-from polymarket_bot.db.enums import CircuitBreakerStatus, PositionStatus
-from polymarket_bot.db.models import CircuitBreakerState, Position
+from polymarket_bot.db.enums import CircuitBreakerStatus
+from polymarket_bot.db.models import CircuitBreakerState
 from polymarket_bot.notifications.telegram_notifier import TelegramNotifier
-
-# Hard stop loss por posição (§7) — −40% do investido.
-HARD_STOP_LOSS_RATIO = Decimal(str(CONST.HARD_STOP_LOSS_PER_POSITION))
 
 # Threshold semanal — abaixo disto, PAUSED até domingo seguinte.
 WEEKLY_STOP_LOSS = float(CONST.WEEKLY_STOP_LOSS)
-
-# Reduções de sizing aplicadas pelo sizer quando em RECOVERY.
-RECOVERY_SIZE_REDUCTION = float(CONST.RECOVERY_MULTIPLIER)
 
 
 class CircuitBreaker:
@@ -106,19 +98,14 @@ class CircuitBreaker:
                 resumes_at = _next_sunday_2330_utc()
                 size_factor = 0.0
             else:
-                # Fora dos thresholds — preserva RECOVERY se já activo, senão NORMAL.
-                new_status = (
-                    CircuitBreakerStatus.RECOVERY
-                    if prev_status == CircuitBreakerStatus.RECOVERY
-                    else CircuitBreakerStatus.NORMAL
-                )
+                # Fora dos thresholds → NORMAL. RECOVERY já não é entrado
+                # automaticamente (era disparado por SLs consecutivos, agora
+                # removidos). Linhas RECOVERY historic ainda podem existir;
+                # tratamos como NORMAL para efeito de sizing.
+                new_status = CircuitBreakerStatus.NORMAL
                 reason = f"weekly P&L {weekly_pnl_pct:+.1%}"
                 resumes_at = None
-                size_factor = (
-                    RECOVERY_SIZE_REDUCTION
-                    if new_status == CircuitBreakerStatus.RECOVERY
-                    else 1.0
-                )
+                size_factor = 1.0
 
             # Cada check-in semanal persiste o estado (counter evolui).
             await self._persist_weekly_check(
@@ -135,72 +122,6 @@ class CircuitBreaker:
         if new_status != prev_status:
             await self._notify_transition(prev_status, new_status, reason)
         return new_status
-
-    # ------------------------------------------------------------------ stop losses
-    async def record_stop_loss(self) -> None:
-        """Regista que uma posição fechou em stop loss. Ao 2.º → RECOVERY."""
-        async with self._sessionmaker() as session:
-            latest = await self._latest(session)
-            prev_status = latest.status if latest else CircuitBreakerStatus.NORMAL
-            prev_neg_weeks = latest.consecutive_negative_weeks if latest else 0
-
-            consecutive = await self._count_consecutive_stop_losses(session)
-            log = logger.bind(consecutive_stop_losses=consecutive)
-
-            if consecutive < 2:
-                log.info(
-                    "circuit_breaker: stop loss registado ({}/2)", consecutive
-                )
-                return
-
-            if prev_status == CircuitBreakerStatus.HALTED:
-                # HALTED é mais severo — não fazemos downgrade.
-                return
-            if prev_status == CircuitBreakerStatus.RECOVERY:
-                return  # já em recovery
-
-            await self._transition_if_changed(
-                session=session,
-                prev_status=prev_status,
-                new_status=CircuitBreakerStatus.RECOVERY,
-                reason=f"{consecutive} stop losses consecutivos",
-                resumes_at=None,
-                consecutive_negative_weeks=prev_neg_weeks,
-                size_reduction_factor=RECOVERY_SIZE_REDUCTION,
-            )
-            await session.commit()
-
-        await self._notify_transition(
-            prev_status,
-            CircuitBreakerStatus.RECOVERY,
-            f"{consecutive} stop losses consecutivos",
-        )
-
-    async def reset_consecutive_losses(self) -> None:
-        """Após uma trade vencedora: se estávamos em RECOVERY *por causa disso*,
-        voltamos a NORMAL. O contador efectivo vive em `Position` — o reset aqui
-        traduz-se em promover o status para NORMAL se apropriado."""
-        async with self._sessionmaker() as session:
-            latest = await self._latest(session)
-            if latest is None or latest.status != CircuitBreakerStatus.RECOVERY:
-                return
-            # Preserva contador de semanas; apenas tira o flag RECOVERY.
-            await self._transition_if_changed(
-                session=session,
-                prev_status=CircuitBreakerStatus.RECOVERY,
-                new_status=CircuitBreakerStatus.NORMAL,
-                reason="trade vencedora — reset consecutive losses",
-                resumes_at=None,
-                consecutive_negative_weeks=latest.consecutive_negative_weeks,
-                size_reduction_factor=1.0,
-            )
-            await session.commit()
-
-        await self._notify_transition(
-            CircuitBreakerStatus.RECOVERY,
-            CircuitBreakerStatus.NORMAL,
-            "reset após trade vencedora",
-        )
 
     # ------------------------------------------------------------------ resume
     async def resume_if_due(self) -> None:
@@ -348,36 +269,6 @@ class CircuitBreaker:
         session.add(row)
         await session.flush()
         return True
-
-    @staticmethod
-    async def _count_consecutive_stop_losses(session: AsyncSession) -> int:
-        """Conta as últimas posições fechadas de trás para a frente até apanhar
-        uma vencedora (ou acabar). Define "stop loss" como P&L ≤ threshold
-        (−40% do size)."""
-        stmt = (
-            select(Position)
-            .where(
-                Position.status == PositionStatus.CLOSED,
-                Position.realized_pnl_usd.is_not(None),
-            )
-            .order_by(desc(Position.closed_at))
-            .limit(20)  # janela generosa para evitar re-scan
-        )
-        rows = (await session.execute(stmt)).scalars().all()
-        count = 0
-        for pos in rows:
-            if pos.realized_pnl_usd is None or pos.size_usd <= 0:
-                continue
-            ratio = pos.realized_pnl_usd / pos.size_usd
-            if ratio <= HARD_STOP_LOSS_RATIO:
-                count += 1
-                continue
-            if pos.realized_pnl_usd > 0:
-                break  # apanhou um win → corta streak
-            # Perda sem atingir hard stop: não conta como stop-loss, mas também
-            # não quebra a streak (pode ter sido exit por wallet em perda).
-            continue
-        return count
 
     async def _notify_transition(
         self,
