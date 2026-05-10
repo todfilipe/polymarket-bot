@@ -196,9 +196,15 @@
     /* ========== Capital panel ========== */
     .capital-grid {
       display: grid;
-      grid-template-columns: repeat(2, 1fr);
+      grid-template-columns: repeat(3, 1fr);
       gap: 12px;
       margin-bottom: 14px;
+    }
+    @media (max-width: 1200px) {
+      .capital-grid { grid-template-columns: repeat(2, 1fr); }
+    }
+    @media (max-width: 600px) {
+      .capital-grid { grid-template-columns: 1fr; }
     }
     .stat {
       padding: 12px 14px;
@@ -478,14 +484,24 @@
             <div class="stat-sub" id="cap-pnl-week-pct">—</div>
           </div>
           <div class="stat">
-            <div class="stat-label">P&amp;L Total</div>
+            <div class="stat-label">P&amp;L Realizado</div>
             <div class="stat-value" id="cap-pnl-total">—</div>
             <div class="stat-sub" id="cap-pnl-total-pct">—</div>
+          </div>
+          <div class="stat">
+            <div class="stat-label">P&amp;L Não realizado</div>
+            <div class="stat-value" id="cap-pnl-unreal">—</div>
+            <div class="stat-sub" id="cap-pnl-unreal-pct">Mark-to-market</div>
           </div>
           <div class="stat">
             <div class="stat-label">Cash disponível</div>
             <div class="stat-value" id="cap-cash">—</div>
             <div class="stat-sub" id="cap-allocated">Alocado: —</div>
+          </div>
+          <div class="stat">
+            <div class="stat-label">Posições abertas</div>
+            <div class="stat-value" id="cap-open-count">—</div>
+            <div class="stat-sub" id="cap-open-limit">de — máx.</div>
           </div>
         </div>
         <div class="progress-row">
@@ -546,40 +562,40 @@
     <div class="grid" style="grid-template-columns: 1.5fr 1fr">
       <div class="panel">
         <div class="panel-title">
-          <span>Histórico de trades</span>
-          <span class="text-muted" id="trades-total">—</span>
+          <span>Posições fechadas</span>
+          <span class="text-muted" id="closed-total">—</span>
         </div>
-        <div class="filter-row" id="trades-filters">
-          <button class="filter-btn active" data-status="ALL">Todos<span class="count" id="cnt-ALL"></span></button>
-          <button class="filter-btn" data-status="FILLED">Executados<span class="count" id="cnt-FILLED"></span></button>
-          <button class="filter-btn" data-status="SKIPPED">Ignorados<span class="count" id="cnt-SKIPPED"></span></button>
-          <button class="filter-btn" data-status="FAILED">Falhados<span class="count" id="cnt-FAILED"></span></button>
-          <button class="filter-btn" data-status="CANCELLED">Cancelados<span class="count" id="cnt-CANCELLED"></span></button>
+        <div class="filter-row" id="closed-filters">
+          <button class="filter-btn active" data-result="ALL">Todas<span class="count" id="cnt-ALL"></span></button>
+          <button class="filter-btn" data-result="WIN">Wins<span class="count" id="cnt-WIN"></span></button>
+          <button class="filter-btn" data-result="LOSS">Losses<span class="count" id="cnt-LOSS"></span></button>
+          <button class="filter-btn" data-result="BREAKEVEN">Breakeven<span class="count" id="cnt-BREAKEVEN"></span></button>
         </div>
         <div style="overflow-x:auto">
-          <table id="trades-table">
+          <table id="closed-table">
             <thead>
               <tr>
-                <th class="nowrap">Hora</th>
+                <th class="nowrap">Fecho</th>
                 <th>Mercado</th>
-                <th>Dir.</th>
+                <th>Direção</th>
+                <th class="nowrap">Entrada</th>
+                <th class="nowrap">Saída</th>
                 <th class="nowrap">Tamanho</th>
-                <th class="nowrap">Preço</th>
-                <th>Status</th>
-                <th>Wallet</th>
-                <th>Motivo skip</th>
+                <th class="nowrap">P&amp;L</th>
+                <th>Resultado</th>
+                <th>Wallets</th>
               </tr>
             </thead>
-            <tbody id="trades-body">
-              <tr class="empty-row"><td colspan="8">A carregar…</td></tr>
+            <tbody id="closed-body">
+              <tr class="empty-row"><td colspan="9">A carregar…</td></tr>
             </tbody>
           </table>
         </div>
         <div class="pagination">
-          <span id="trades-page-info">—</span>
+          <span id="closed-page-info">—</span>
           <div class="pager-btns">
-            <button class="pager-btn" id="trades-prev">‹ Anterior</button>
-            <button class="pager-btn" id="trades-next">Seguinte ›</button>
+            <button class="pager-btn" id="closed-prev">‹ Anterior</button>
+            <button class="pager-btn" id="closed-next">Seguinte ›</button>
           </div>
         </div>
       </div>
@@ -594,9 +610,9 @@
                 <th>Address</th>
                 <th>Tier</th>
                 <th>Score</th>
-                <th class="nowrap">Win Rate</th>
-                <th>PF</th>
-                <th>DD</th>
+                <th class="nowrap" title="Win rate histórico da wallet (Polymarket)">WR hist.</th>
+                <th class="nowrap" title="P&amp;L atribuído pelo bot (50/50 em consenso)">P&amp;L bot</th>
+                <th class="nowrap" title="Wins / Losses do bot ao seguir esta wallet">Record</th>
               </tr>
             </thead>
             <tbody id="wallets-body">
@@ -615,9 +631,9 @@
   <script>
     // ===== State =====
     const state = {
-      tradesPage: 1,
-      tradesPerPage: 20,
-      tradesStatus: 'ALL',
+      closedPage: 1,
+      closedPerPage: 20,
+      closedResult: 'ALL',
       offlineEndpoints: new Set(),
       weekly: [],
     };
@@ -745,7 +761,7 @@
       renderModeBanner(data.mode);
     }
 
-    function renderCapital(data) {
+    function renderCapital(data, riskData) {
       if (!data) return;
       const cur = data.capital_current ?? data.capital_initial;
       document.getElementById('cap-current').textContent = fmtMoney(cur);
@@ -765,8 +781,26 @@
       totPct.textContent = fmtPct(data.pnl_total_pct, true);
       totPct.className = `stat-sub ${colorClass(data.pnl_total_pct)}`;
 
+      // P&L unrealized — mark-to-market das posições abertas
+      const unrealEl = document.getElementById('cap-pnl-unreal');
+      const unrealVal = data.pnl_unrealized_usd;
+      unrealEl.textContent = fmtMoney(unrealVal);
+      unrealEl.className = `stat-value ${colorClass(unrealVal)}`;
+      const unrealPct = document.getElementById('cap-pnl-unreal-pct');
+      unrealPct.textContent = unrealVal === 0
+        ? 'Mark-to-market'
+        : `${fmtPct(data.pnl_unrealized_pct, true)} · em aberto`;
+      unrealPct.className = `stat-sub ${colorClass(unrealVal)}`;
+
       document.getElementById('cap-cash').textContent = fmtMoney(data.cash_available_usd);
       document.getElementById('cap-allocated').textContent = `Alocado: ${fmtMoney(data.allocated_usd)}`;
+
+      // Posições abertas — usar dados do risk endpoint (limite real do bot)
+      const exp = (riskData && riskData.exposure) || {};
+      const openCount = exp.open_positions_count ?? 0;
+      const openLimit = exp.open_positions_limit ?? 30;
+      document.getElementById('cap-open-count').textContent = openCount;
+      document.getElementById('cap-open-limit').textContent = `de ${openLimit} máx.`;
 
       // Stop loss bar — proporção do P&L semanal vs limite -15%
       const limit = Math.abs(data.weekly_stop_loss_usd || 150);
@@ -806,26 +840,37 @@
       }
       tbody.innerHTML = data.positions
         .map((p) => {
-          const market = p.question
+          const label = p.question
             ? `<span class="truncate" title="${escapeHtml(p.question)}">${escapeHtml(p.question)}</span>`
             : `<code>${escapeHtml(p.market_id.slice(0, 14))}…</code>`;
+          // Link só se temos URL válido (slug do Gamma)
+          const market = p.market_url
+            ? `<a href="${escapeHtml(p.market_url)}" target="_blank" rel="noopener">${label}</a>`
+            : label;
+          const entries = p.entries_count && p.entries_count > 1
+            ? ` <span class="badge badge-blue" title="Pyramiding">×${p.entries_count}</span>`
+            : '';
           const pnlClass = p.pnl_usd === null ? 'text-muted' : colorClass(p.pnl_usd);
           const pnlTxt =
             p.pnl_usd === null
               ? 'N/A'
               : `${fmtMoney(p.pnl_usd)} <span class="text-muted">(${fmtPct(p.pnl_pct, true)})</span>`;
           const stopCls = p.near_stop ? 'text-red' : 'text-muted';
+          // Stop title indica que está ancorado na 1ª entrada (sl_anchor)
+          const stopTitle = p.sl_anchor_price && p.entries_count > 1
+            ? `Ancorado na 1ª entrada @ ${fmtPrice(p.sl_anchor_price)}`
+            : 'Stop a -40% da entrada';
           const wallets = (p.followed_wallets_short || [])
             .map((w) => `<code>${escapeHtml(w)}</code>`)
             .join(' ');
           return `<tr>
-            <td><a href="${escapeHtml(p.market_url)}" target="_blank" rel="noopener">${market}</a></td>
+            <td>${market}${entries}</td>
             <td>${sideBadge(p.side, p.outcome)}</td>
             <td class="nowrap">${fmtPrice(p.avg_entry_price)}</td>
             <td class="nowrap">${fmtMoney(p.size_usd)}</td>
             <td class="nowrap">${p.current_price === null ? '<span class="text-muted">N/A</span>' : fmtPrice(p.current_price)}</td>
             <td class="nowrap ${pnlClass}">${pnlTxt}</td>
-            <td class="nowrap ${stopCls}">${fmtPrice(p.stop_price)}</td>
+            <td class="nowrap ${stopCls}" title="${escapeHtml(stopTitle)}">${fmtPrice(p.stop_price)}</td>
             <td>${wallets || '<span class="text-muted">—</span>'}</td>
             <td class="nowrap text-muted" title="${escapeHtml(fmtClock(p.opened_at))}">${relativeTime(p.opened_at)}</td>
           </tr>`;
@@ -833,42 +878,37 @@
         .join('');
     }
 
-    function tradeStatusBadge(status) {
+    function resultBadge(result) {
       const map = {
-        FILLED: 'badge-green',
-        SKIPPED: 'badge-gray',
-        FAILED: 'badge-red',
-        CANCELLED: 'badge-orange',
-        PENDING: 'badge-blue',
-        SUBMITTED: 'badge-blue',
-        PARTIAL: 'badge-yellow',
+        WIN: 'badge-green',
+        LOSS: 'badge-red',
+        BREAKEVEN: 'badge-gray',
       };
-      const cls = map[status] || 'badge-gray';
-      return `<span class="badge ${cls}">${escapeHtml(status)}</span>`;
+      const labels = { WIN: 'WIN', LOSS: 'LOSS', BREAKEVEN: 'BE' };
+      const cls = map[result] || 'badge-gray';
+      return `<span class="badge ${cls}">${escapeHtml(labels[result] || result)}</span>`;
     }
 
-    function renderTrades(data) {
-      const tbody = document.getElementById('trades-body');
-      const totalEl = document.getElementById('trades-total');
-      const pageInfo = document.getElementById('trades-page-info');
-      const prev = document.getElementById('trades-prev');
-      const next = document.getElementById('trades-next');
+    function renderClosed(data) {
+      const tbody = document.getElementById('closed-body');
+      const totalEl = document.getElementById('closed-total');
+      const pageInfo = document.getElementById('closed-page-info');
+      const prev = document.getElementById('closed-prev');
+      const next = document.getElementById('closed-next');
 
       // Update counts on filter buttons
       const counts = (data && data.counts) || {};
-      const allCount = Object.values(counts).reduce((a, b) => a + b, 0);
       const setCount = (id, n) => {
         const el = document.getElementById(`cnt-${id}`);
         if (el) el.textContent = n ? ` (${n})` : '';
       };
-      setCount('ALL', allCount);
-      setCount('FILLED', counts.FILLED || 0);
-      setCount('SKIPPED', counts.SKIPPED || 0);
-      setCount('FAILED', counts.FAILED || 0);
-      setCount('CANCELLED', counts.CANCELLED || 0);
+      setCount('ALL', counts.ALL || 0);
+      setCount('WIN', counts.WIN || 0);
+      setCount('LOSS', counts.LOSS || 0);
+      setCount('BREAKEVEN', counts.BREAKEVEN || 0);
 
-      if (!data || !data.trades) {
-        tbody.innerHTML = '<tr class="empty-row"><td colspan="8">Sem dados</td></tr>';
+      if (!data || !data.positions) {
+        tbody.innerHTML = '<tr class="empty-row"><td colspan="9">Sem dados</td></tr>';
         totalEl.textContent = '—';
         pageInfo.textContent = '—';
         return;
@@ -880,33 +920,37 @@
       prev.disabled = data.page <= 1;
       next.disabled = data.page >= totalPages;
 
-      if (data.trades.length === 0) {
-        tbody.innerHTML = '<tr class="empty-row"><td colspan="8">Sem trades para este filtro</td></tr>';
+      if (data.positions.length === 0) {
+        tbody.innerHTML = '<tr class="empty-row"><td colspan="9">Sem posições fechadas para este filtro</td></tr>';
         return;
       }
 
-      tbody.innerHTML = data.trades
-        .map((t) => {
-          const ts = t.executed_at || t.submitted_at || t.created_at;
-          const market = `<a href="${escapeHtml(t.market_url)}" target="_blank" rel="noopener"><code>${escapeHtml(t.market_id.slice(0, 12))}…</code></a>`;
-          const price = t.executed_price !== null && t.executed_price !== undefined
-            ? fmtPrice(t.executed_price)
-            : `<span class="text-muted">${fmtPrice(t.intended_price)}</span>`;
-          const wallet = t.followed_wallet_short
-            ? `<code>${escapeHtml(t.followed_wallet_short)}</code>`
+      tbody.innerHTML = data.positions
+        .map((p) => {
+          const label = p.question
+            ? `<span class="truncate" title="${escapeHtml(p.question)}">${escapeHtml(p.question)}</span>`
+            : `<code>${escapeHtml(p.market_id.slice(0, 12))}…</code>`;
+          const market = p.market_url
+            ? `<a href="${escapeHtml(p.market_url)}" target="_blank" rel="noopener">${label}</a>`
+            : label;
+          const pnlClass = colorClass(p.realized_pnl_usd);
+          const pnlTxt = `${fmtMoney(p.realized_pnl_usd)} <span class="text-muted">(${fmtPct(p.realized_pnl_pct, true)})</span>`;
+          const exitTxt = p.exit_price !== null && p.exit_price !== undefined
+            ? fmtPrice(p.exit_price)
             : '<span class="text-muted">—</span>';
-          const skipReason = t.status === 'SKIPPED' && t.skip_reason
-            ? `<span class="text-muted truncate" title="${escapeHtml(t.skip_reason)}">${escapeHtml(t.skip_reason)}</span>`
-            : '<span class="text-muted">—</span>';
+          const wallets = (p.followed_wallets_short || [])
+            .map((w) => `<code>${escapeHtml(w)}</code>`)
+            .join(' ');
           return `<tr>
-            <td class="nowrap text-muted" title="${escapeHtml(fmtClock(ts))}">${relativeTime(ts)}</td>
+            <td class="nowrap text-muted" title="${escapeHtml(fmtClock(p.closed_at))}">${relativeTime(p.closed_at)}</td>
             <td>${market}</td>
-            <td>${sideBadge(t.side, t.outcome)}</td>
-            <td class="nowrap">${fmtMoney(t.size_usd)}</td>
-            <td class="nowrap">${price}</td>
-            <td>${tradeStatusBadge(t.status)}</td>
-            <td>${wallet}</td>
-            <td>${skipReason}</td>
+            <td>${sideBadge(p.side, p.outcome)}</td>
+            <td class="nowrap">${fmtPrice(p.avg_entry_price)}</td>
+            <td class="nowrap">${exitTxt}</td>
+            <td class="nowrap">${fmtMoney(p.size_usd)}</td>
+            <td class="nowrap ${pnlClass}">${pnlTxt}</td>
+            <td>${resultBadge(p.result)}</td>
+            <td>${wallets || '<span class="text-muted">—</span>'}</td>
           </tr>`;
         })
         .join('');
@@ -943,20 +987,20 @@
           const winRate = w.win_rate !== null && w.win_rate !== undefined
             ? `${(w.win_rate * 100).toFixed(0)}%`
             : '—';
-          const pf = w.profit_factor !== null && w.profit_factor !== undefined
-            ? Number(w.profit_factor).toFixed(2)
-            : '—';
-          const dd = w.max_drawdown !== null && w.max_drawdown !== undefined
-            ? `${(w.max_drawdown * 100).toFixed(0)}%`
-            : '—';
+          // P&L do bot atribuído a esta wallet (50/50 quando consenso)
+          const botPnl = w.bot_pnl_usd ?? 0;
+          const botPnlCls = colorClass(botPnl);
+          const botRecord = (w.bot_wins || 0) + (w.bot_losses || 0) > 0
+            ? `<span class="text-muted" style="font-size:11px">${w.bot_wins}W / ${w.bot_losses}L</span>`
+            : '<span class="text-muted" style="font-size:11px">—</span>';
           return `<tr>
             <td class="text-muted">${w.rank}</td>
             <td><a href="${escapeHtml(w.profile_url)}" target="_blank" rel="noopener"><code>${escapeHtml(w.address_short)}…</code></a></td>
             <td><span class="badge ${tierCls}">${escapeHtml(w.tier || '—')}</span></td>
             <td>${scoreBar}</td>
             <td class="nowrap">${winRate}</td>
-            <td>${pf}</td>
-            <td>${dd}</td>
+            <td class="nowrap ${botPnlCls}">${fmtMoney(botPnl)}</td>
+            <td>${botRecord}</td>
           </tr>`;
         })
         .join('');
@@ -1011,31 +1055,41 @@
 
       // Total allocated
       const allocPct = exp.total_allocated_pct || 0;
-      const allocCls = allocPct >= 70 ? 'danger' : allocPct >= 50 ? 'warn' : 'blue';
+      // Limite efectivo de alocação = 100% - cash reserve = 70%
+      const allocLimit = 100 - (exp.cash_reserve_limit_pct ?? 30);
+      const allocRatio = allocLimit ? (allocPct / allocLimit) * 100 : 0;
+      const allocCls = allocRatio >= 90 ? 'danger' : allocRatio >= 60 ? 'warn' : 'blue';
       html += `<div class="exposure-row">
         <div class="progress-label" style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px">
           <span class="text-muted">Total alocado (cash reserve ${exp.cash_reserve_limit_pct?.toFixed?.(0) ?? '30'}%)</span>
-          <span>${allocPct.toFixed(1)}%</span>
+          <span>${allocPct.toFixed(1)}% / ${allocLimit.toFixed(0)}%</span>
         </div>
-        <div class="progress"><div class="progress-fill ${allocCls}" style="width:${Math.min(100, allocPct).toFixed(1)}%"></div></div>
+        <div class="progress"><div class="progress-fill ${allocCls}" style="width:${Math.min(100, allocRatio).toFixed(1)}%"></div></div>
       </div>`;
 
-      // Per category
-      if (exp.by_category && exp.by_category.length > 0) {
-        html += `<div style="margin-top:14px;font-size:12px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.05em">Por categoria</div>`;
-        for (const c of exp.by_category) {
-          const ratio = c.limit_pct ? (c.allocated_pct / c.limit_pct) * 100 : 0;
+      // Caps de referência (per-position e per-event)
+      const perPos = exp.max_per_position_pct?.toFixed?.(0) ?? '8';
+      const perEv = exp.max_per_event_pct?.toFixed?.(0) ?? '15';
+      html += `<div class="text-muted" style="margin-top:8px;font-size:11px">
+        Caps: <strong>${perPos}%</strong> por posição · <strong>${perEv}%</strong> por evento
+      </div>`;
+
+      // Por wallet seguida (50/50 em consenso)
+      if (exp.by_wallet && exp.by_wallet.length > 0) {
+        html += `<div style="margin-top:14px;font-size:12px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.05em">Por wallet seguida</div>`;
+        for (const w of exp.by_wallet) {
+          const ratio = w.limit_pct ? (w.allocated_pct / w.limit_pct) * 100 : 0;
           const cls = ratio >= 90 ? 'danger' : ratio >= 60 ? 'warn' : 'blue';
           html += `<div class="exposure-row" style="margin-top:8px">
             <div class="progress-label" style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px">
-              <span>${escapeHtml(c.category)}</span>
-              <span class="text-muted">${c.allocated_pct.toFixed(1)}% / ${c.limit_pct.toFixed(0)}%</span>
+              <span><code>${escapeHtml(w.address_short)}…</code></span>
+              <span class="text-muted">${w.allocated_pct.toFixed(1)}% (${fmtMoney(w.allocated_usd)})</span>
             </div>
             <div class="progress"><div class="progress-fill ${cls}" style="width:${Math.min(100, ratio).toFixed(1)}%"></div></div>
           </div>`;
         }
       } else {
-        html += `<div class="text-muted" style="margin-top:14px;font-size:12px">Sem exposição por categoria</div>`;
+        html += `<div class="text-muted" style="margin-top:14px;font-size:12px">Sem posições abertas</div>`;
       }
 
       el.innerHTML = html;
@@ -1141,20 +1195,20 @@
 
     // ===== Loaders =====
     async function loadAll() {
-      const [status, capital, positions, trades, wallets, risk, weekly] = await Promise.all([
+      const [status, capital, positions, closed, wallets, risk, weekly] = await Promise.all([
         fetchJson('/api/status'),
         fetchJson('/api/capital'),
         fetchJson('/api/positions'),
-        fetchJson(`/api/trades?status=${state.tradesStatus}&page=${state.tradesPage}&per_page=${state.tradesPerPage}`),
+        fetchJson(`/api/positions/closed?result=${state.closedResult}&page=${state.closedPage}&per_page=${state.closedPerPage}`),
         fetchJson('/api/wallets'),
         fetchJson('/api/risk'),
         fetchJson('/api/performance/weekly'),
       ]);
 
       renderStatus(status);
-      renderCapital(capital);
+      renderCapital(capital, risk);
       renderPositions(positions);
-      renderTrades(trades);
+      renderClosed(closed);
       renderWallets(wallets);
       renderRisk(risk);
       drawWeeklyChart(weekly && weekly.weeks);
@@ -1166,34 +1220,34 @@
       document.getElementById('last-success').textContent = `Última leitura: ${stamp}`;
     }
 
-    async function loadTrades() {
-      const url = `/api/trades?status=${state.tradesStatus}&page=${state.tradesPage}&per_page=${state.tradesPerPage}`;
+    async function loadClosed() {
+      const url = `/api/positions/closed?result=${state.closedResult}&page=${state.closedPage}&per_page=${state.closedPerPage}`;
       const data = await fetchJson(url);
-      renderTrades(data);
+      renderClosed(data);
       updateOfflineBanner();
     }
 
     // ===== Event handlers =====
-    document.querySelectorAll('#trades-filters .filter-btn').forEach((btn) => {
+    document.querySelectorAll('#closed-filters .filter-btn').forEach((btn) => {
       btn.addEventListener('click', () => {
         document
-          .querySelectorAll('#trades-filters .filter-btn')
+          .querySelectorAll('#closed-filters .filter-btn')
           .forEach((b) => b.classList.remove('active'));
         btn.classList.add('active');
-        state.tradesStatus = btn.dataset.status;
-        state.tradesPage = 1;
-        loadTrades();
+        state.closedResult = btn.dataset.result;
+        state.closedPage = 1;
+        loadClosed();
       });
     });
-    document.getElementById('trades-prev').addEventListener('click', () => {
-      if (state.tradesPage > 1) {
-        state.tradesPage -= 1;
-        loadTrades();
+    document.getElementById('closed-prev').addEventListener('click', () => {
+      if (state.closedPage > 1) {
+        state.closedPage -= 1;
+        loadClosed();
       }
     });
-    document.getElementById('trades-next').addEventListener('click', () => {
-      state.tradesPage += 1;
-      loadTrades();
+    document.getElementById('closed-next').addEventListener('click', () => {
+      state.closedPage += 1;
+      loadClosed();
     });
 
     window.addEventListener('resize', () => drawWeeklyChart(state.weekly));

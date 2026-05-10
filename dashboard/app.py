@@ -9,8 +9,10 @@ Lançar: ``python dashboard/app.py``
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -213,27 +215,21 @@ async def api_capital() -> dict[str, Any]:
     weekly_stop_loss_pct = CONST.WEEKLY_STOP_LOSS * 100  # -15.0
     weekly_stop_loss_usd = CAPITAL_INITIAL * CONST.WEEKLY_STOP_LOSS
 
+    open_rows: list[Position] = []
     try:
         async with await _open_session() as session:
-            allocated = (
+            open_rows = (
                 await session.execute(
-                    select(func.coalesce(func.sum(Position.size_usd), 0)).where(
+                    select(Position).where(
                         Position.status.in_(
                             [PositionStatus.OPEN, PositionStatus.PARTIALLY_CLOSED]
                         )
                     )
                 )
-            ).scalar() or 0
-            allocated_usd = _to_float(allocated)
+            ).scalars().all()
+            allocated_usd = sum(_to_float(p.size_usd) for p in open_rows)
 
-            pnl_total = (
-                await session.execute(
-                    select(
-                        func.coalesce(func.sum(BotTrade.expected_value), 0)
-                    )  # placeholder, vai ser substituído
-                )
-            ).scalar()
-            # P&L acumulado real lê-se de positions fechadas + bot_trades realized
+            # P&L realizado (positions fechadas)
             pnl_total_realized = (
                 await session.execute(
                     select(func.coalesce(func.sum(Position.realized_pnl_usd), 0)).where(
@@ -260,12 +256,30 @@ async def api_capital() -> dict[str, Any]:
                 "pnl_week_pct": 0.0,
                 "pnl_total_usd": 0.0,
                 "pnl_total_pct": 0.0,
+                "pnl_unrealized_usd": 0.0,
+                "pnl_unrealized_pct": 0.0,
                 "allocated_usd": 0.0,
                 "cash_available_usd": CAPITAL_INITIAL,
                 "weekly_stop_loss_pct": weekly_stop_loss_pct,
                 "weekly_stop_loss_usd": weekly_stop_loss_usd,
             }
         )
+
+    # P&L unrealized — mark-to-market das posições abertas via Gamma (cacheado)
+    pnl_unrealized_usd = 0.0
+    if open_rows:
+        async with httpx.AsyncClient() as client:
+            metas = await asyncio.gather(
+                *[_fetch_market_meta(client, p.market_id) for p in open_rows],
+                return_exceptions=False,
+            )
+        for p, meta in zip(open_rows, metas):
+            entry = _to_float(p.avg_entry_price)
+            size = _to_float(p.size_usd)
+            current = _price_from_meta(meta, p.outcome)
+            if current is None or entry <= 0 or size <= 0:
+                continue
+            pnl_unrealized_usd += ((current - entry) / entry) * size
 
     capital_now = CAPITAL_INITIAL + pnl_total_usd
     cash_available = max(0.0, capital_now - allocated_usd)
@@ -277,6 +291,8 @@ async def api_capital() -> dict[str, Any]:
         "pnl_week_pct": round(100 * pnl_week_usd / CAPITAL_INITIAL, 2),
         "pnl_total_usd": round(pnl_total_usd, 2),
         "pnl_total_pct": round(100 * pnl_total_usd / CAPITAL_INITIAL, 2),
+        "pnl_unrealized_usd": round(pnl_unrealized_usd, 2),
+        "pnl_unrealized_pct": round(100 * pnl_unrealized_usd / CAPITAL_INITIAL, 2),
         "allocated_usd": round(allocated_usd, 2),
         "cash_available_usd": round(cash_available, 2),
         "weekly_stop_loss_pct": weekly_stop_loss_pct,
@@ -289,10 +305,35 @@ async def api_capital() -> dict[str, Any]:
 # /api/positions
 # ---------------------------------------------------------------------------
 
-async def _fetch_market_price(
-    client: httpx.AsyncClient, market_id: str, outcome: str
-) -> float | None:
-    """Lê o preço atual do outcome via Gamma API. Retorna None em falha."""
+# ---------------------------------------------------------------------------
+# Meta-cache do Gamma — slug, eventSlug, question, category, outcomes, prices.
+#
+# A tabela `markets` no DB nunca é populada pelo bot, e os mercados-alvo são
+# identificados por `conditionId` (0x...). O frontend antes construía URLs do
+# tipo `polymarket.com/market/{conditionId}` que devolvem 404 — Polymarket usa
+# slugs (`/event/{eventSlug}` ou `/market/{slug}`). Buscamos a meta on-demand
+# e cacheamos in-process por TTL para não martelar o Gamma.
+# ---------------------------------------------------------------------------
+
+_META_CACHE_TTL_SECONDS = 300  # 5 min
+_market_meta_cache: dict[str, tuple[datetime, dict[str, Any]]] = {}
+
+
+async def _fetch_market_meta(
+    client: httpx.AsyncClient, market_id: str
+) -> dict[str, Any] | None:
+    """Busca meta + preços actuais do Gamma. Cacheado in-process por TTL.
+
+    Devolve dict com `slug`, `event_slug`, `question`, `category`, `outcomes`
+    (lista) e `prices` (lista alinhada com outcomes). Em falha devolve None.
+    """
+    now = datetime.now(timezone.utc)
+    cached = _market_meta_cache.get(market_id)
+    if cached:
+        cached_at, data = cached
+        if (now - cached_at).total_seconds() < _META_CACHE_TTL_SECONDS:
+            return data
+
     try:
         if market_id.lower().startswith("0x"):
             r = await client.get(
@@ -303,6 +344,16 @@ async def _fetch_market_price(
             r.raise_for_status()
             payload = r.json()
             data = payload[0] if isinstance(payload, list) and payload else None
+            if data is None:
+                # Mercado pode estar resolvido — Gamma filtra por default. Tenta closed.
+                r = await client.get(
+                    f"{GAMMA_API_URL}/markets",
+                    params={"condition_ids": market_id, "closed": "true"},
+                    timeout=5.0,
+                )
+                r.raise_for_status()
+                payload = r.json()
+                data = payload[0] if isinstance(payload, list) and payload else None
         else:
             r = await client.get(f"{GAMMA_API_URL}/markets/{market_id}", timeout=5.0)
             r.raise_for_status()
@@ -311,12 +362,10 @@ async def _fetch_market_price(
         if not isinstance(data, dict):
             return None
 
+        # Os campos `outcomes` e `outcomePrices` vêm como string JSON em alguns
+        # endpoints — normalizar para listas Python.
         outcomes_raw = data.get("outcomes")
         prices_raw = data.get("outcomePrices")
-
-        # Os campos vêm como string JSON em alguns endpoints
-        import json
-
         if isinstance(outcomes_raw, str):
             try:
                 outcomes_raw = json.loads(outcomes_raw)
@@ -328,19 +377,60 @@ async def _fetch_market_price(
             except json.JSONDecodeError:
                 prices_raw = None
 
-        if not isinstance(outcomes_raw, list) or not isinstance(prices_raw, list):
-            return None
-
-        outcome_upper = outcome.upper()
-        for name, price in zip(outcomes_raw, prices_raw):
-            if str(name).upper() == outcome_upper:
-                try:
-                    return float(price)
-                except (TypeError, ValueError):
-                    return None
-        return None
+        meta: dict[str, Any] = {
+            "slug": (data.get("slug") or "").strip() or None,
+            "event_slug": (data.get("eventSlug") or "").strip() or None,
+            "question": (data.get("question") or data.get("title") or "").strip() or None,
+            "category": (data.get("category") or "").strip() or None,
+            "outcomes": outcomes_raw if isinstance(outcomes_raw, list) else None,
+            "prices": prices_raw if isinstance(prices_raw, list) else None,
+        }
+        _market_meta_cache[market_id] = (now, meta)
+        return meta
     except (httpx.HTTPError, ValueError):
         return None
+
+
+def _build_market_url(meta: dict[str, Any] | None) -> str | None:
+    """Monta URL Polymarket. Preferência: /event/{eventSlug} > /market/{slug}.
+
+    Devolve None se nenhum slug disponível — o frontend mostra texto sem link.
+    """
+    if not meta:
+        return None
+    event_slug = meta.get("event_slug")
+    slug = meta.get("slug")
+    if event_slug:
+        return f"https://polymarket.com/event/{event_slug}"
+    if slug:
+        return f"https://polymarket.com/market/{slug}"
+    return None
+
+
+def _price_from_meta(meta: dict[str, Any] | None, outcome: str) -> float | None:
+    """Extrai preço actual do outcome a partir da meta cacheada."""
+    if not meta:
+        return None
+    outcomes = meta.get("outcomes")
+    prices = meta.get("prices")
+    if not isinstance(outcomes, list) or not isinstance(prices, list):
+        return None
+    outcome_up = outcome.upper()
+    for name, price in zip(outcomes, prices):
+        if str(name).upper() == outcome_up:
+            try:
+                return float(price)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+async def _fetch_market_price(
+    client: httpx.AsyncClient, market_id: str, outcome: str
+) -> float | None:
+    """Wrapper retro-compatível — usa o cache de meta."""
+    meta = await _fetch_market_meta(client, market_id)
+    return _price_from_meta(meta, outcome)
 
 
 @app.get("/api/positions")
@@ -375,39 +465,47 @@ async def api_positions() -> dict[str, Any]:
     if not rows:
         return {"positions": [], "db_offline": False}
 
-    # Buscar preços actuais em paralelo
+    # Buscar meta (slug+question+preço) em paralelo. Uma chamada por mercado
+    # único — não por outcome — graças ao cache.
     async with httpx.AsyncClient() as client:
-        price_tasks = [
-            _fetch_market_price(client, p.market_id, p.outcome) for p in rows
-        ]
-        prices = await asyncio.gather(*price_tasks, return_exceptions=False)
+        meta_tasks = [_fetch_market_meta(client, p.market_id) for p in rows]
+        metas = await asyncio.gather(*meta_tasks, return_exceptions=False)
 
     positions = []
     now = datetime.now(timezone.utc)
-    for p, current_price in zip(rows, prices):
+    for p, meta in zip(rows, metas):
         entry = _to_float(p.avg_entry_price)
+        # SL ancorado na 1ª entrada; cai em avg_entry_price para posições legacy.
+        sl_anchor = _to_float(p.sl_anchor_price) if p.sl_anchor_price is not None else entry
         size = _to_float(p.size_usd)
         opened_at = p.opened_at
         if opened_at and opened_at.tzinfo is None:
             opened_at = opened_at.replace(tzinfo=timezone.utc)
 
+        current_price = _price_from_meta(meta, p.outcome)
         pnl_usd: float | None = None
         pnl_pct: float | None = None
         if current_price is not None and entry > 0:
             pnl_pct = (current_price - entry) / entry
             pnl_usd = pnl_pct * size
 
-        # Hard stop: -40% do investido — preço de saída é entry × (1 + (-0.40)) = entry × 0.60
-        stop_price = entry * (1 + CONST.HARD_STOP_LOSS_PER_POSITION)
+        # Hard stop: -40% do SL anchor (1ª entrada). Não desce com averaging-down.
+        stop_price = sl_anchor * (1 + CONST.HARD_STOP_LOSS_PER_POSITION)
         near_stop = (
             current_price is not None
-            and entry > 0
+            and sl_anchor > 0
             and current_price <= stop_price * 1.10
         )
 
-        market_meta = markets_map.get(p.market_id)
-        question = market_meta.question if market_meta else None
-        category = market_meta.category if market_meta else None
+        # Meta do Gamma tem prioridade; cai em Market do DB se existir.
+        db_market = markets_map.get(p.market_id)
+        question = (meta.get("question") if meta else None) or (
+            db_market.question if db_market else None
+        )
+        category = (meta.get("category") if meta else None) or (
+            db_market.category if db_market else None
+        )
+        market_url = _build_market_url(meta)
 
         followed = list(p.followed_wallets or [])
 
@@ -415,13 +513,15 @@ async def api_positions() -> dict[str, Any]:
             {
                 "id": p.id,
                 "market_id": p.market_id,
-                "market_url": f"https://polymarket.com/market/{p.market_id}",
+                "market_url": market_url,
                 "question": question,
                 "category": category,
                 "outcome": p.outcome,
                 "side": p.side.value,
                 "is_paper": p.is_paper,
                 "avg_entry_price": entry,
+                "sl_anchor_price": sl_anchor,
+                "entries_count": int(p.entries_count or 1),
                 "size_usd": size,
                 "current_price": current_price,
                 "pnl_usd": round(pnl_usd, 2) if pnl_usd is not None else None,
@@ -438,6 +538,154 @@ async def api_positions() -> dict[str, Any]:
         )
 
     return {"positions": positions, "db_offline": False}
+
+
+# ---------------------------------------------------------------------------
+# /api/positions/closed — histórico de posições fechadas com filtro WIN/LOSE
+# ---------------------------------------------------------------------------
+
+# Threshold para classificar BREAKEVEN — abaixo disto considera-se zero (rounding).
+_BREAKEVEN_USD_THRESHOLD = 0.01
+
+VALID_RESULT_FILTERS = {"ALL", "WIN", "LOSS", "BREAKEVEN"}
+
+
+def _classify_result(pnl_usd: float) -> str:
+    if pnl_usd > _BREAKEVEN_USD_THRESHOLD:
+        return "WIN"
+    if pnl_usd < -_BREAKEVEN_USD_THRESHOLD:
+        return "LOSS"
+    return "BREAKEVEN"
+
+
+@app.get("/api/positions/closed")
+async def api_positions_closed(
+    result: str = Query("ALL"),
+    wallet: str | None = Query(None),
+    page: int = Query(1, ge=1),
+    per_page: int = Query(20, ge=1, le=100),
+) -> dict[str, Any]:
+    result = result.upper()
+    if result not in VALID_RESULT_FILTERS:
+        raise HTTPException(
+            status_code=400, detail=f"result inválido: {result}"
+        )
+
+    try:
+        async with await _open_session() as session:
+            rows = (
+                await session.execute(
+                    select(Position)
+                    .where(Position.status == PositionStatus.CLOSED)
+                    .where(Position.realized_pnl_usd.isnot(None))
+                    .order_by(desc(Position.closed_at))
+                )
+            ).scalars().all()
+    except SQLAlchemyError:
+        return _empty_payload(
+            {
+                "positions": [],
+                "total": 0,
+                "page": page,
+                "per_page": per_page,
+                "counts": {"WIN": 0, "LOSS": 0, "BREAKEVEN": 0, "ALL": 0},
+            }
+        )
+
+    # Filtro por wallet (Python-side; SQLite não tem suporte JSON portátil).
+    if wallet:
+        wallet_lc = wallet.lower()
+        rows = [
+            p for p in rows
+            if any(w.lower() == wallet_lc for w in (p.followed_wallets or []))
+        ]
+
+    # Counts globais (depois do filtro de wallet, antes do filtro de result)
+    counts = {"WIN": 0, "LOSS": 0, "BREAKEVEN": 0}
+    for p in rows:
+        counts[_classify_result(_to_float(p.realized_pnl_usd))] += 1
+    counts["ALL"] = sum(counts.values())
+
+    # Filtro de resultado
+    if result != "ALL":
+        rows = [
+            p for p in rows
+            if _classify_result(_to_float(p.realized_pnl_usd)) == result
+        ]
+
+    total = len(rows)
+    offset = (page - 1) * per_page
+    page_rows = rows[offset : offset + per_page]
+
+    # Buscar meta (slug+question) em paralelo apenas para a página actual
+    if page_rows:
+        async with httpx.AsyncClient() as client:
+            metas = await asyncio.gather(
+                *[_fetch_market_meta(client, p.market_id) for p in page_rows],
+                return_exceptions=False,
+            )
+    else:
+        metas = []
+
+    positions = []
+    for p, meta in zip(page_rows, metas):
+        entry = _to_float(p.avg_entry_price)
+        size = _to_float(p.size_usd)
+        pnl = _to_float(p.realized_pnl_usd)
+        pnl_pct = (pnl / size * 100) if size > 0 else 0.0
+        # Preço de saída implícito: entry × (1 + pnl_pct_unitario)
+        exit_price: float | None
+        if size > 0 and entry > 0:
+            exit_price = round(entry * (1 + pnl / size), 4)
+        else:
+            exit_price = None
+
+        followed = list(p.followed_wallets or [])
+        opened_at = p.opened_at
+        if opened_at and opened_at.tzinfo is None:
+            opened_at = opened_at.replace(tzinfo=timezone.utc)
+        closed_at = p.closed_at
+        if closed_at and closed_at.tzinfo is None:
+            closed_at = closed_at.replace(tzinfo=timezone.utc)
+        held_seconds = (
+            int((closed_at - opened_at).total_seconds())
+            if opened_at and closed_at
+            else None
+        )
+
+        positions.append(
+            {
+                "id": p.id,
+                "market_id": p.market_id,
+                "market_url": _build_market_url(meta),
+                "question": meta.get("question") if meta else None,
+                "category": meta.get("category") if meta else None,
+                "outcome": p.outcome,
+                "side": p.side.value,
+                "is_paper": p.is_paper,
+                "avg_entry_price": entry,
+                "exit_price": exit_price,
+                "size_usd": size,
+                "realized_pnl_usd": round(pnl, 2),
+                "realized_pnl_pct": round(pnl_pct, 2),
+                "result": _classify_result(pnl),
+                "entries_count": int(p.entries_count or 1),
+                "followed_wallets": followed,
+                "followed_wallets_short": [w[:6] for w in followed],
+                "opened_at": _iso(opened_at),
+                "closed_at": _iso(closed_at),
+                "held_seconds": held_seconds,
+            }
+        )
+
+    return {
+        "positions": positions,
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+        "counts": counts,
+        "db_offline": False,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -554,6 +802,36 @@ async def api_wallets() -> dict[str, Any]:
                 )
             ).scalars().all()
 
+            # Carregar todas as positions fechadas para atribuir P&L por wallet.
+            # Atribuição 50/50: cada wallet em followed_wallets leva pnl/N.
+            closed_rows = (
+                await session.execute(
+                    select(Position)
+                    .where(Position.status == PositionStatus.CLOSED)
+                    .where(Position.realized_pnl_usd.isnot(None))
+                )
+            ).scalars().all()
+
+            wallet_pnl: dict[str, float] = defaultdict(float)
+            wallet_wins: dict[str, int] = defaultdict(int)
+            wallet_losses: dict[str, int] = defaultdict(int)
+            for p in closed_rows:
+                addrs = list(p.followed_wallets or [])
+                if not addrs:
+                    continue
+                pnl = _to_float(p.realized_pnl_usd)
+                share = pnl / len(addrs)
+                # Win/loss atribuído por position completa (não por share),
+                # para reflectir "esta wallet entrou em N trades vencedoras".
+                is_win = pnl > _BREAKEVEN_USD_THRESHOLD
+                is_loss = pnl < -_BREAKEVEN_USD_THRESHOLD
+                for addr in addrs:
+                    wallet_pnl[addr] += share
+                    if is_win:
+                        wallet_wins[addr] += 1
+                    elif is_loss:
+                        wallet_losses[addr] += 1
+
             results: list[dict[str, Any]] = []
             for w in wallets:
                 latest_score = (
@@ -565,12 +843,19 @@ async def api_wallets() -> dict[str, Any]:
                     )
                 ).scalar_one_or_none()
 
+                addr = w.address
+                bot_pnl = wallet_pnl.get(addr, 0.0)
+                bot_wins = wallet_wins.get(addr, 0)
+                bot_losses = wallet_losses.get(addr, 0)
+                bot_total = bot_wins + bot_losses
+                bot_win_rate = bot_wins / bot_total if bot_total > 0 else None
+
                 results.append(
                     {
-                        "address": w.address,
-                        "address_short": w.address[:10],
+                        "address": addr,
+                        "address_short": addr[:10],
                         "tier": w.current_tier.value if w.current_tier else None,
-                        "profile_url": f"https://polymarket.com/profile/{w.address}",
+                        "profile_url": f"https://polymarket.com/profile/{addr}",
                         "score": float(latest_score.total_score) if latest_score else None,
                         "win_rate": float(latest_score.win_rate) if latest_score else None,
                         "profit_factor": float(latest_score.profit_factor)
@@ -583,6 +868,11 @@ async def api_wallets() -> dict[str, Any]:
                         if latest_score
                         else None,
                         "scored_at": _iso(latest_score.scored_at) if latest_score else None,
+                        # P&L atribuído pelo bot (50/50 em consenso)
+                        "bot_pnl_usd": round(bot_pnl, 2),
+                        "bot_wins": bot_wins,
+                        "bot_losses": bot_losses,
+                        "bot_win_rate": bot_win_rate,
                     }
                 )
     except SQLAlchemyError:
@@ -602,7 +892,8 @@ async def api_wallets() -> dict[str, Any]:
 @app.get("/api/risk")
 async def api_risk() -> dict[str, Any]:
     cash_reserve_pct_limit = CONST.CASH_RESERVE_RATIO * 100
-    max_per_category_pct = CONST.MAX_RATIO_PER_CATEGORY * 100
+    max_per_event_pct = CONST.MAX_RATIO_PER_EVENT * 100   # 15%
+    max_per_position_pct = CONST.MAX_SIZE_RATIO * 100     # 8%
     max_open_positions = CONST.MAX_OPEN_POSITIONS
 
     cb_payload = {
@@ -613,6 +904,9 @@ async def api_risk() -> dict[str, Any]:
         "triggered_at": None,
         "resumes_at": None,
     }
+
+    open_rows: list[Position] = []
+    capital_now: float = CAPITAL_INITIAL
 
     try:
         async with await _open_session() as session:
@@ -631,7 +925,6 @@ async def api_risk() -> dict[str, Any]:
                     "resumes_at": _iso(cb.resumes_at),
                 }
 
-            # P&L total para calcular capital actual
             pnl_total_realized = (
                 await session.execute(
                     select(func.coalesce(func.sum(Position.realized_pnl_usd), 0)).where(
@@ -641,7 +934,6 @@ async def api_risk() -> dict[str, Any]:
             ).scalar() or 0
             capital_now = CAPITAL_INITIAL + _to_float(pnl_total_realized)
 
-            # Posições abertas + categorias
             open_rows = (
                 await session.execute(
                     select(Position).where(
@@ -651,22 +943,6 @@ async def api_risk() -> dict[str, Any]:
                     )
                 )
             ).scalars().all()
-
-            allocated_total = sum(_to_float(p.size_usd) for p in open_rows)
-
-            cat_map: dict[str, float] = {}
-            if open_rows:
-                market_ids = list({p.market_id for p in open_rows})
-                m_rows = (
-                    await session.execute(
-                        select(Market).where(Market.market_id.in_(market_ids))
-                    )
-                ).scalars().all()
-                m_cat = {m.market_id: (m.category or "uncategorized") for m in m_rows}
-
-                for p in open_rows:
-                    cat = m_cat.get(p.market_id, "uncategorized")
-                    cat_map[cat] = cat_map.get(cat, 0.0) + _to_float(p.size_usd)
     except SQLAlchemyError:
         return _empty_payload(
             {
@@ -677,27 +953,41 @@ async def api_risk() -> dict[str, Any]:
                     "total_allocated_pct": 0.0,
                     "cash_reserve_pct": 100.0,
                     "cash_reserve_limit_pct": cash_reserve_pct_limit,
-                    "by_category": [],
+                    "max_per_event_pct": max_per_event_pct,
+                    "max_per_position_pct": max_per_position_pct,
+                    "by_wallet": [],
                     "open_positions_count": 0,
                     "open_positions_limit": max_open_positions,
                 },
             }
         )
 
+    allocated_total = sum(_to_float(p.size_usd) for p in open_rows)
     base = capital_now if capital_now > 0 else CAPITAL_INITIAL
     total_alloc_pct = (allocated_total / base) * 100 if base else 0.0
     cash_pct = max(0.0, 100.0 - total_alloc_pct)
 
-    by_cat = []
-    for cat, val in sorted(cat_map.items(), key=lambda kv: kv[1], reverse=True):
-        by_cat.append(
-            {
-                "category": cat,
-                "allocated_usd": round(val, 2),
-                "allocated_pct": round((val / base) * 100, 2) if base else 0.0,
-                "limit_pct": max_per_category_pct,
-            }
-        )
+    # Atribuição 50/50: cada wallet em followed_wallets leva size/len(wallets).
+    # Um trade de consenso (2 wallets) reparte 50/50; solo wallet leva tudo.
+    wallet_alloc: dict[str, float] = defaultdict(float)
+    for p in open_rows:
+        wallets = list(p.followed_wallets or [])
+        if not wallets:
+            continue
+        share = _to_float(p.size_usd) / len(wallets)
+        for w in wallets:
+            wallet_alloc[w] += share
+
+    by_wallet = [
+        {
+            "address": addr,
+            "address_short": addr[:6],
+            "allocated_usd": round(val, 2),
+            "allocated_pct": round((val / base) * 100, 2) if base else 0.0,
+            "limit_pct": max_per_position_pct,
+        }
+        for addr, val in sorted(wallet_alloc.items(), key=lambda kv: kv[1], reverse=True)
+    ]
 
     return {
         "circuit_breaker": cb_payload,
@@ -707,8 +997,10 @@ async def api_risk() -> dict[str, Any]:
             "total_allocated_pct": round(total_alloc_pct, 2),
             "cash_reserve_pct": round(cash_pct, 2),
             "cash_reserve_limit_pct": cash_reserve_pct_limit,
-            "by_category": by_cat,
-            "open_positions_count": len(open_rows) if "open_rows" in locals() else 0,
+            "max_per_event_pct": max_per_event_pct,
+            "max_per_position_pct": max_per_position_pct,
+            "by_wallet": by_wallet,
+            "open_positions_count": len(open_rows),
             "open_positions_limit": max_open_positions,
         },
         "db_offline": False,
