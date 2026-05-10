@@ -344,6 +344,66 @@ def test_update_followed_wallets_replaces_set():
     assert watcher.followed_addresses == {b.address}
 
 
+# --------------------------------------------------------------- server-side filter
+
+
+def test_topic_filter_includes_followed_wallets_as_topic2():
+    """Filtro WS/HTTP deve incluir as wallets seguidas em topics[2] (maker
+    address indexado, padded a 32 bytes). Reduz drasticamente o tráfego de
+    eventos vindos do provider — corte de >99% no custo de notificações WS.
+    """
+    a = _wallet("0xaaaa000000000000000000000000000000000000")
+    b = _wallet("0xbbbb000000000000000000000000000000000000")
+    watcher = _make_watcher([a, b])
+
+    flt = watcher._build_topic_filter()
+
+    assert flt["address"] == watcher._exchanges
+    assert flt["topics"][0] == ORDER_FILLED_TOPIC
+    assert flt["topics"][1] is None  # qualquer orderHash
+    maker_topics = flt["topics"][2]
+    # 2 wallets → 2 topics no array
+    assert len(maker_topics) == 2
+    # Cada topic deve ser bytes32 (66 chars com 0x) e conter o address
+    # padded à esquerda com zeros.
+    for t in maker_topics:
+        assert t.startswith("0x")
+        assert len(t) == 66
+        assert t[:26] == "0x" + "0" * 24  # 24 zero hex chars de padding
+
+
+def test_topic_filter_falls_back_to_broad_when_no_wallets():
+    """Sem wallets carregadas (estado inicial), o filtro evita topic[2].
+
+    Caso contrário enviaríamos um array vazio que muitos providers tratam
+    como "match nothing" → não receberíamos nada até update_followed_wallets.
+    """
+    watcher = _make_watcher([])
+
+    flt = watcher._build_topic_filter()
+
+    assert flt["topics"] == [ORDER_FILLED_TOPIC]
+
+
+def test_update_wallets_signals_resubscribe():
+    """Uma mudança na lista de wallets deve marcar o flag ``_needs_resubscribe``
+    para o consumer do WS reconectar e aplicar o novo filtro server-side."""
+    a = _wallet("0xaaaa000000000000000000000000000000000000")
+    b = _wallet("0xbbbb000000000000000000000000000000000000")
+    watcher = _make_watcher([a])
+
+    # Estado inicial após o construtor — flag pode estar a True (set inicial).
+    watcher._needs_resubscribe = False
+
+    # Mesma lista — não deve sinalizar.
+    watcher.update_followed_wallets([a])
+    assert watcher._needs_resubscribe is False
+
+    # Lista diferente — sinaliza.
+    watcher.update_followed_wallets([a, b])
+    assert watcher._needs_resubscribe is True
+
+
 # --------------------------------------------------------------- integration with SignalReader
 
 

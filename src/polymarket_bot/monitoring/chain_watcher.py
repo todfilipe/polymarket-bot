@@ -77,13 +77,11 @@ _REPLAY_BLOCKS = 200
 _HTTP_POLL_INTERVAL_SECONDS = 15
 _WS_RECONNECT_INITIAL_DELAY = 1.0
 _WS_RECONNECT_MAX_DELAY = 60.0
-# eth_getLogs: Alchemy free tier impõe um cap de 10 blocos por chamada
-# (mensagem explícita: "Under the Free tier plan, you can make eth_getLogs
-# requests with up to a 10 block range"). 10 é o default seguro que funciona
-# em todos os providers free. Em paid tiers (Alchemy Growth+, Infura paid,
-# QuickNode) suportam ranges de centenas/milhares — pode-se aumentar via
-# variável de ambiente se quiseres reduzir requests.
-_MAX_LOG_RANGE = 10
+# eth_getLogs: providers pagos (QuickNode Build, Alchemy Growth+, Infura paid)
+# aceitam ranges de milhares de blocos. 100 é seguro para todos eles e reduz
+# o nº de requests na ordem de 10× (importante em catch-up e replay).
+# Free tiers (Alchemy free = 10 blocos) precisam de baixar para 10.
+_MAX_LOG_RANGE = 100
 
 
 SignalCallback = Callable[[DetectedSignal], Awaitable[None]]
@@ -204,6 +202,11 @@ class ChainWatcher:
         self._seen_logs: set[tuple[str, int]] = set()
         self._last_block: int | None = None
         self._rpc_id = 0
+        # Sinaliza ao consumer WS que a lista de wallets mudou e a subscrição
+        # actual está stale. Próximo tick do consumer fecha e re-subscreve com
+        # filtro novo. Necessário porque o filtro server-side (`topics[2]`)
+        # codifica os endereços no momento da subscrição.
+        self._needs_resubscribe = False
 
     # ------------------------------------------------------------------ public
     def update_followed_wallets(
@@ -213,9 +216,17 @@ class ChainWatcher:
 
         Endereços normalizados para lowercase em ambos os lados (mapa + set) —
         comparações com `parsed.maker`/`taker` são sempre case-insensitive.
+
+        Sinaliza ao loop WS que a subscrição precisa de ser refeita: o filtro
+        server-side `topics[2]` é fixado no momento do subscribe e ficaria
+        stale com wallets novas.
         """
-        self._followed_map = {w.address.lower(): w for w in wallets}
-        self._followed_addresses = set(self._followed_map.keys())
+        new_map = {w.address.lower(): w for w in wallets}
+        new_addresses = set(new_map.keys())
+        if new_addresses != self._followed_addresses:
+            self._needs_resubscribe = True
+        self._followed_map = new_map
+        self._followed_addresses = new_addresses
 
     @property
     def followed_addresses(self) -> set[str]:
@@ -476,8 +487,15 @@ class ChainWatcher:
         return str(msg.get("result") or "")
 
     async def _ws_consume(self, ws: Any) -> None:
-        """Lê mensagens push até o socket fechar ou `stop()` ser chamado."""
+        """Lê mensagens push até o socket fechar, `stop()` ser chamado, ou
+        `_needs_resubscribe` ficar a True (rebalanceamento de wallets)."""
         while not self._stop.is_set():
+            if self._needs_resubscribe:
+                self._needs_resubscribe = False
+                logger.info(
+                    "chain_watcher: wallets mudaram — a re-subscrever WS"
+                )
+                return  # sai do consume → outer loop reconnects com filtro novo
             try:
                 raw = await asyncio.wait_for(ws.recv(), timeout=30.0)
             except asyncio.TimeoutError:
@@ -497,13 +515,34 @@ class ChainWatcher:
     def _build_topic_filter(self) -> dict[str, Any]:
         """Filter object para `eth_getLogs` / `eth_subscribe`.
 
-        Usamos topic[0] = OrderFilled. Filtragem por maker/taker faz-se localmente
-        em `_handle_log` — manter um único filtro simplifica WS subscriptions e
-        evita reabrir o socket sempre que a lista de wallets seguidas muda.
+        **Filtragem server-side por maker** — o ``OrderFilled`` event tem o
+        ``maker`` em ``topics[2]`` (address indexado, padded a 32 bytes).
+        Pedindo ao provider para filtrar pela nossa lista de wallets seguidas
+        reduz o tráfego de ~87 events/sec (todos os trades de Polymarket)
+        para ~0.01 events/sec (só das nossas wallets) — corte de >99% no
+        custo de notificações WS em providers que cobram por mensagem
+        (Alchemy, p.ex., bills 10 CU por notificação).
+
+        Antes filtrávamos no cliente: simples mas catastrófico em custo.
+        Cada wallet add/remove obriga a re-subscrever (ver `_ws_consume`).
+
+        Se ``_followed_addresses`` está vazio (estado inicial), cai no
+        filtro largo — a próxima ``update_followed_wallets`` vai disparar
+        re-subscribe automático.
         """
+        topics: list[Any] = [ORDER_FILLED_TOPIC]
+        if self._followed_addresses:
+            # Padding a 32 bytes para topic-format: address (20 bytes) à
+            # direita, zeros à esquerda → 64 chars hex + 0x.
+            maker_topics = sorted(
+                "0x" + addr.removeprefix("0x").lower().rjust(64, "0")
+                for addr in self._followed_addresses
+            )
+            topics.append(None)            # topic[1] = orderHash, qualquer
+            topics.append(maker_topics)    # topic[2] = maker IN (nossas wallets)
         return {
             "address": self._exchanges,
-            "topics": [ORDER_FILLED_TOPIC],
+            "topics": topics,
         }
 
     # ------------------------------------------------------------------ log processing
@@ -682,12 +721,15 @@ class ChainWatcher:
     async def _eth_get_logs(
         self, from_block: int, to_block: int
     ) -> list[dict[str, Any]]:
+        # Reutiliza o mesmo filtro do WS (server-side por maker) para HTTP
+        # polling. Reduz drasticamente os logs devolvidos e o custo em
+        # providers que tarifam por log retornado.
+        filt = self._build_topic_filter()
         params = [
             {
                 "fromBlock": hex(from_block),
                 "toBlock": hex(to_block),
-                "address": self._exchanges,
-                "topics": [ORDER_FILLED_TOPIC],
+                **filt,
             }
         ]
         result = await self._rpc("eth_getLogs", params)
