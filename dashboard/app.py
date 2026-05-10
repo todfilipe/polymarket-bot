@@ -212,7 +212,7 @@ async def api_status() -> dict[str, Any]:
 @app.get("/api/capital")
 async def api_capital() -> dict[str, Any]:
     week_start = _start_of_iso_week_utc()
-    weekly_stop_loss_pct = CONST.WEEKLY_STOP_LOSS * 100  # -15.0
+    weekly_stop_loss_pct = CONST.WEEKLY_STOP_LOSS * 100  # -25.0 (semana pausa)
     weekly_stop_loss_usd = CAPITAL_INITIAL * CONST.WEEKLY_STOP_LOSS
 
     open_rows: list[Position] = []

@@ -12,7 +12,12 @@ class StrategyConstants:
     # --- Capital e objetivos (§1, §7.1) ---
     TARGET_WEEKLY_RETURN_MIN: float = 0.01
     TARGET_WEEKLY_RETURN_MAX: float = 0.05
-    WEEKLY_STOP_LOSS: float = -0.15
+    # Threshold semanal para pausar até domingo. Subido de -15% → -25% após
+    # remover o hard SL: com cap 10% por posição, 1-2 trades full-loss
+    # chegavam para disparar -15%, o que pausava cedo demais. A -25% só
+    # dispara se ~2.5 trades full-loss numa semana (sinal genuíno de
+    # cohort má, não ruído).
+    WEEKLY_STOP_LOSS: float = -0.25
     CASH_RESERVE_RATIO: float = 0.30
 
     # --- Sizing ---

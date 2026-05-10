@@ -837,8 +837,8 @@
       document.getElementById('cap-open-count').textContent = openCount;
       document.getElementById('cap-open-limit').textContent = `de ${openLimit} máx.`;
 
-      // Stop loss bar — proporção do P&L semanal vs limite -15%
-      const limit = Math.abs(data.weekly_stop_loss_usd || 150);
+      // Stop loss bar — proporção do P&L semanal vs limite (CONST.WEEKLY_STOP_LOSS, -25%)
+      const limit = Math.abs(data.weekly_stop_loss_usd || 250);
       const lossUsed = Math.min(Math.abs(Math.min(0, data.pnl_week_usd || 0)), limit);
       const ratio = limit ? (lossUsed / limit) * 100 : 0;
       const bar = document.getElementById('weekly-stop-bar');

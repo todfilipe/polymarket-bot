@@ -87,7 +87,8 @@ async def test_normal_pnl_stays_normal(sessionmaker):
 @pytest.mark.asyncio
 async def test_weekly_loss_over_threshold_triggers_paused(sessionmaker):
     cb = CircuitBreaker(sessionmaker)
-    status = await cb.check_and_trigger(weekly_pnl_pct=-0.20)
+    # -30% < threshold -25% → PAUSED
+    status = await cb.check_and_trigger(weekly_pnl_pct=-0.30)
 
     assert status == CircuitBreakerStatus.PAUSED
     rows = await _all_states(sessionmaker)
@@ -104,9 +105,20 @@ async def test_weekly_loss_over_threshold_triggers_paused(sessionmaker):
 @pytest.mark.asyncio
 async def test_weekly_loss_exactly_at_threshold_triggers_paused(sessionmaker):
     cb = CircuitBreaker(sessionmaker)
-    status = await cb.check_and_trigger(weekly_pnl_pct=-0.15)
+    # Threshold é -25% (CONST.WEEKLY_STOP_LOSS)
+    status = await cb.check_and_trigger(weekly_pnl_pct=-0.25)
 
     assert status == CircuitBreakerStatus.PAUSED
+
+
+@pytest.mark.asyncio
+async def test_weekly_loss_below_threshold_stays_normal(sessionmaker):
+    """Após subir threshold para -25%, perdas até -24% ficam em NORMAL.
+    Antes (-15%), -20% disparava PAUSED prematuramente."""
+    cb = CircuitBreaker(sessionmaker)
+    status = await cb.check_and_trigger(weekly_pnl_pct=-0.20)
+
+    assert status == CircuitBreakerStatus.NORMAL
 
 
 @pytest.mark.asyncio
