@@ -2,12 +2,17 @@
 
 Sequência UTC:
 
-    22:00 dom   → `job_weekly_report`        — envia relatório via Telegram
     22:30 dom   → `job_close_removed_wallets`— marca posições órfãs para review
     22:55 dom   → `job_paper_reset`          — paper only: fecha tudo + snapshot
     23:00 dom   → `job_score_wallets`        — check circuit breaker + scoring
     23:30 dom   → `job_select_top7`          — persiste novas 7 + recarrega monitor
     00:00 seg   → `job_reset_weekly_state`   — nova semana sem carry-over
+    00:30 seg   → `job_weekly_report`        — relatório Telegram (depois de tudo)
+
+O relatório corre **por último**, garantindo que mostra dados consistentes:
+performance da semana terminada + as 7 wallets já seleccionadas para a
+semana nova. Antes corria às 22:00 dom e a secção "Próximas 7" aparecia
+vazia porque o select_top7 só corria às 23:30.
 
 Cada job é independente: falha de um não cancela os outros. Erros são
 notificados via Telegram e relogados, mas NÃO propagam.
@@ -117,9 +122,12 @@ class RebalancingScheduler:
 
     # ------------------------------------------------------------------ registration
     def _register_jobs(self) -> None:
+        # Relatório corre POR ÚLTIMO (segunda 00:30 UTC) — depois de scoring
+        # e select_top7 já terem persistido as novas wallets. Antes corria às
+        # 22:00 dom, antes da selecção, e mostrava "Próximas 7: (nenhuma)".
         self._scheduler.add_job(
             self._safe_run,
-            CronTrigger(day_of_week="sun", hour=22, minute=0, timezone=timezone.utc),
+            CronTrigger(day_of_week="mon", hour=0, minute=30, timezone=timezone.utc),
             args=["job_weekly_report", self.job_weekly_report],
             id="job_weekly_report",
             replace_existing=True,
