@@ -290,9 +290,13 @@ class RebalancingScheduler:
                 start=Decimal("0"),
             )
 
-            # Posições ainda abertas — fechar mark-to-market
+            # Posições ainda abertas — fechar mark-to-market.
+            # Inclui PARTIALLY_CLOSED para apanhar legacy do TP parcial (já
+            # removido do exit_manager mas pode haver linhas órfãs).
             open_stmt = select(Position).where(
-                Position.status == PositionStatus.OPEN
+                Position.status.in_(
+                    [PositionStatus.OPEN, PositionStatus.PARTIALLY_CLOSED]
+                )
             )
             open_positions = list((await session.execute(open_stmt)).scalars().all())
 
@@ -329,7 +333,7 @@ class RebalancingScheduler:
 
                 async with self._sessionmaker() as session:
                     fresh = await session.get(Position, pos.id)
-                    if fresh is None or fresh.status != PositionStatus.OPEN:
+                    if fresh is None or fresh.status == PositionStatus.CLOSED:
                         continue
                     fresh.status = PositionStatus.CLOSED
                     fresh.closed_at = now

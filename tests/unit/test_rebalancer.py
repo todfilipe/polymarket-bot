@@ -360,6 +360,51 @@ async def test_job_paper_reset_creates_snapshot_and_closes_open_positions(
 
 
 @pytest.mark.asyncio
+async def test_job_paper_reset_closes_partially_closed_positions_too(sessionmaker):
+    """Posições em PARTIALLY_CLOSED (legacy do TP parcial removido) também
+    têm de ser fechadas pelo paper_reset — antes ficavam órfãs para sempre."""
+    from polymarket_bot.db.enums import PositionStatus, TradeSide
+    from polymarket_bot.db.models import Position, WeeklySnapshot
+
+    pc_pos = Position(
+        market_id="evt_legacy",
+        outcome="YES",
+        side=TradeSide.BUY,
+        status=PositionStatus.PARTIALLY_CLOSED,
+        is_paper=True,
+        size_usd=Decimal("50"),
+        avg_entry_price=Decimal("0.40"),
+        entries_count=2,
+        opened_at=datetime.now(timezone.utc),
+        closed_at=None,
+        realized_pnl_usd=None,
+        followed_wallets=["0xlegacy"],
+        notes="partial_taken",
+    )
+    async with sessionmaker() as s:
+        s.add(pc_pos)
+        await s.commit()
+
+    market_builder = MagicMock()
+    market_snap = SimpleNamespace(implied_probability=Decimal("0.50"))
+    market_builder.build = AsyncMock(return_value=market_snap)
+
+    scheduler = _make_scheduler(sessionmaker)
+    scheduler._live_mode = False
+    scheduler._market_builder = market_builder
+
+    await scheduler.job_paper_reset()
+
+    async with sessionmaker() as s:
+        snap = (await s.execute(select(WeeklySnapshot))).scalar_one()
+        # PARTIALLY_CLOSED contou como force_closed
+        assert snap.n_force_closed == 1
+        fresh = await s.get(Position, pc_pos.id)
+        assert fresh.status == PositionStatus.CLOSED
+        assert fresh.notes == "paper_reset"
+
+
+@pytest.mark.asyncio
 async def test_job_paper_reset_hard_reset_ignores_previous_weeks_pnl(sessionmaker):
     """Hard reset: capital_start é SEMPRE $1000, mesmo com P&L acumulado
     de semanas anteriores. Cada cohort é avaliada isoladamente."""
