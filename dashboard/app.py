@@ -211,6 +211,19 @@ async def api_status() -> dict[str, Any]:
 
 @app.get("/api/capital")
 async def api_capital() -> dict[str, Any]:
+    """Capital reportado em modo **hard-reset semanal**.
+
+    Em paper-mode com reset cíclico aos domingos, cada cohort de 7 wallets
+    corre uma semana isoladamente. O dashboard reflecte isso:
+
+    - ``capital_current`` = $1.000 + P&L realizado **desta semana** + unrealized
+    - ``pnl_week_usd`` = P&L realizado desta semana (= realizado lifetime no
+      contexto hard-reset, porque o que houve antes pertence a outra cohort)
+    - ``pnl_unrealized_usd`` = mark-to-market das abertas
+
+    P&L cumulativo lifetime é visível no painel "Snapshots semanais"
+    (soma dos `capital_end_usd - capital_start_usd` em todos os snapshots).
+    """
     week_start = _start_of_iso_week_utc()
     weekly_stop_loss_pct = CONST.WEEKLY_STOP_LOSS * 100  # -25.0 (semana pausa)
     weekly_stop_loss_usd = CAPITAL_INITIAL * CONST.WEEKLY_STOP_LOSS
@@ -229,16 +242,9 @@ async def api_capital() -> dict[str, Any]:
             ).scalars().all()
             allocated_usd = sum(_to_float(p.size_usd) for p in open_rows)
 
-            # P&L realizado (positions fechadas)
-            pnl_total_realized = (
-                await session.execute(
-                    select(func.coalesce(func.sum(Position.realized_pnl_usd), 0)).where(
-                        Position.status == PositionStatus.CLOSED
-                    )
-                )
-            ).scalar() or 0
-            pnl_total_usd = _to_float(pnl_total_realized)
-
+            # P&L realizado **desta semana** (positions fechadas com
+            # closed_at >= week_start). Em hard-reset, isto é o único
+            # P&L que conta para a banca actual.
             pnl_week_realized = (
                 await session.execute(
                     select(func.coalesce(func.sum(Position.realized_pnl_usd), 0))
@@ -254,8 +260,6 @@ async def api_capital() -> dict[str, Any]:
                 "capital_initial": CAPITAL_INITIAL,
                 "pnl_week_usd": 0.0,
                 "pnl_week_pct": 0.0,
-                "pnl_total_usd": 0.0,
-                "pnl_total_pct": 0.0,
                 "pnl_unrealized_usd": 0.0,
                 "pnl_unrealized_pct": 0.0,
                 "allocated_usd": 0.0,
@@ -281,7 +285,8 @@ async def api_capital() -> dict[str, Any]:
                 continue
             pnl_unrealized_usd += ((current - entry) / entry) * size
 
-    capital_now = CAPITAL_INITIAL + pnl_total_usd
+    # HARD RESET: capital_current = $1000 + pnl_semana + unrealized
+    capital_now = CAPITAL_INITIAL + pnl_week_usd + pnl_unrealized_usd
     cash_available = max(0.0, capital_now - allocated_usd)
 
     return {
@@ -289,8 +294,6 @@ async def api_capital() -> dict[str, Any]:
         "capital_current": round(capital_now, 2),
         "pnl_week_usd": round(pnl_week_usd, 2),
         "pnl_week_pct": round(100 * pnl_week_usd / CAPITAL_INITIAL, 2),
-        "pnl_total_usd": round(pnl_total_usd, 2),
-        "pnl_total_pct": round(100 * pnl_total_usd / CAPITAL_INITIAL, 2),
         "pnl_unrealized_usd": round(pnl_unrealized_usd, 2),
         "pnl_unrealized_pct": round(100 * pnl_unrealized_usd / CAPITAL_INITIAL, 2),
         "allocated_usd": round(allocated_usd, 2),
@@ -998,14 +1001,17 @@ async def api_risk() -> dict[str, Any]:
                     "resumes_at": _iso(cb.resumes_at),
                 }
 
-            pnl_total_realized = (
+            # HARD RESET: capital base é $1000 + pnl realizado desta semana
+            # (não cumulativo). Coerente com /api/capital.
+            week_start = _start_of_iso_week_utc()
+            pnl_week_realized = (
                 await session.execute(
-                    select(func.coalesce(func.sum(Position.realized_pnl_usd), 0)).where(
-                        Position.status == PositionStatus.CLOSED
-                    )
+                    select(func.coalesce(func.sum(Position.realized_pnl_usd), 0))
+                    .where(Position.status == PositionStatus.CLOSED)
+                    .where(Position.closed_at >= week_start)
                 )
             ).scalar() or 0
-            capital_now = CAPITAL_INITIAL + _to_float(pnl_total_realized)
+            capital_now = CAPITAL_INITIAL + _to_float(pnl_week_realized)
 
             open_rows = (
                 await session.execute(

@@ -476,22 +476,17 @@
           <div class="stat">
             <div class="stat-label">Capital atual</div>
             <div class="stat-value" id="cap-current">—</div>
-            <div class="stat-sub" id="cap-initial">Inicial: —</div>
+            <div class="stat-sub" id="cap-initial">Inicial (semana): —</div>
           </div>
           <div class="stat">
-            <div class="stat-label">P&amp;L Semana</div>
+            <div class="stat-label" title="P&amp;L realizado desta semana — em paper-mode reseta aos domingos 22:55 UTC">P&amp;L Realizado (semana)</div>
             <div class="stat-value" id="cap-pnl-week">—</div>
             <div class="stat-sub" id="cap-pnl-week-pct">—</div>
           </div>
           <div class="stat">
-            <div class="stat-label">P&amp;L Realizado</div>
-            <div class="stat-value" id="cap-pnl-total">—</div>
-            <div class="stat-sub" id="cap-pnl-total-pct">—</div>
-          </div>
-          <div class="stat">
-            <div class="stat-label">P&amp;L Não realizado</div>
+            <div class="stat-label" title="Mark-to-market das posições abertas">P&amp;L Não realizado</div>
             <div class="stat-value" id="cap-pnl-unreal">—</div>
-            <div class="stat-sub" id="cap-pnl-unreal-pct">Mark-to-market</div>
+            <div class="stat-sub" id="cap-pnl-unreal-pct">—</div>
           </div>
           <div class="stat">
             <div class="stat-label">Cash disponível</div>
@@ -800,7 +795,7 @@
       if (!data) return;
       const cur = data.capital_current ?? data.capital_initial;
       document.getElementById('cap-current').textContent = fmtMoney(cur);
-      document.getElementById('cap-initial').textContent = `Inicial: ${fmtMoney(data.capital_initial)}`;
+      document.getElementById('cap-initial').textContent = `Inicial (semana): ${fmtMoney(data.capital_initial)}`;
 
       const wkEl = document.getElementById('cap-pnl-week');
       wkEl.textContent = fmtMoney(data.pnl_week_usd);
@@ -809,16 +804,9 @@
       wkPct.textContent = fmtPct(data.pnl_week_pct, true);
       wkPct.className = `stat-sub ${colorClass(data.pnl_week_pct)}`;
 
-      const totEl = document.getElementById('cap-pnl-total');
-      totEl.textContent = fmtMoney(data.pnl_total_usd);
-      totEl.className = `stat-value ${colorClass(data.pnl_total_usd)}`;
-      const totPct = document.getElementById('cap-pnl-total-pct');
-      totPct.textContent = fmtPct(data.pnl_total_pct, true);
-      totPct.className = `stat-sub ${colorClass(data.pnl_total_pct)}`;
-
       // P&L unrealized — mark-to-market das posições abertas
       const unrealEl = document.getElementById('cap-pnl-unreal');
-      const unrealVal = data.pnl_unrealized_usd;
+      const unrealVal = data.pnl_unrealized_usd || 0;
       unrealEl.textContent = fmtMoney(unrealVal);
       unrealEl.className = `stat-value ${colorClass(unrealVal)}`;
       const unrealPct = document.getElementById('cap-pnl-unreal-pct');

@@ -360,6 +360,50 @@ async def test_job_paper_reset_creates_snapshot_and_closes_open_positions(
 
 
 @pytest.mark.asyncio
+async def test_job_paper_reset_hard_reset_ignores_previous_weeks_pnl(sessionmaker):
+    """Hard reset: capital_start é SEMPRE $1000, mesmo com P&L acumulado
+    de semanas anteriores. Cada cohort é avaliada isoladamente."""
+    from datetime import timedelta
+    from polymarket_bot.db.enums import PositionStatus, TradeSide
+    from polymarket_bot.db.models import Position, WeeklySnapshot
+
+    # Posição fechada **há 2 semanas** (fora da semana actual) com -$150 loss
+    long_ago = datetime.now(timezone.utc) - timedelta(weeks=2)
+    async with sessionmaker() as s:
+        s.add(
+            Position(
+                market_id="evt_old",
+                outcome="YES",
+                side=TradeSide.BUY,
+                status=PositionStatus.CLOSED,
+                is_paper=True,
+                size_usd=Decimal("100"),
+                avg_entry_price=Decimal("0.50"),
+                entries_count=1,
+                opened_at=long_ago,
+                closed_at=long_ago + timedelta(hours=12),
+                realized_pnl_usd=Decimal("-150"),  # perda grande no passado
+                followed_wallets=["0xold"],
+            )
+        )
+        await s.commit()
+
+    market_builder = MagicMock()
+    market_builder.build = AsyncMock()
+
+    scheduler = _make_scheduler(sessionmaker)
+    scheduler._live_mode = False
+    scheduler._market_builder = market_builder
+
+    await scheduler.job_paper_reset()
+
+    async with sessionmaker() as s:
+        snap = (await s.execute(select(WeeklySnapshot))).scalar_one()
+        # Mesmo com -$150 de pnl_before, capital_start é $1000 (hard reset)
+        assert snap.capital_start_usd == Decimal("1000")
+
+
+@pytest.mark.asyncio
 async def test_job_paper_reset_idempotent_same_week(sessionmaker):
     """Correr duas vezes na mesma semana não cria duplicado."""
     market_builder = MagicMock()

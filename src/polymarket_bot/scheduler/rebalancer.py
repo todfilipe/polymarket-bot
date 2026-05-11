@@ -235,17 +235,20 @@ class RebalancingScheduler:
         )
 
     async def job_paper_reset(self) -> None:
-        """Paper-mode only: fecha posições abertas + cria snapshot semanal.
+        """Paper-mode only: hard reset semanal. Fecha posições abertas e cria
+        snapshot.
 
-        Em paper, cada cohort de 7 wallets corre 1 semana. Aos domingos
-        22:55 fechamos tudo a preço actual (mark-to-market via Gamma) e
-        registamos um ``WeeklySnapshot`` com capital início/fim, contagens
-        e P&L. O ``CircuitBreakerState`` também reseta para NORMAL.
+        Cada cohort de 7 wallets é avaliada **isoladamente**: o capital de
+        início é sempre ``PAPER_INITIAL_CAPITAL_USD`` ($1000), independente
+        do P&L acumulado das semanas anteriores. Isto permite ver
+        claramente "esta cohort rendeu X%" sem influência do histórico
+        — útil para testes de estratégia e benchmarking de cohorts.
 
         Em LIVE mode é no-op — não tocamos em ordens reais.
 
         Os dados históricos ficam intactos: ``Position`` continua na DB
-        com ``status=CLOSED``, e o snapshot é só uma agregação.
+        com ``status=CLOSED``, e o snapshot é só uma agregação que serve
+        para o dashboard saber qual é o "capital inicial" desta semana.
         """
         if self._live_mode:
             logger.info("scheduler: paper_reset — skip (LIVE mode)")
@@ -272,17 +275,9 @@ class RebalancingScheduler:
                 )
                 return
 
-            # Capital de início = $1000 + realized antes desta semana
-            pnl_before_stmt = select(Position.realized_pnl_usd).where(
-                Position.status == PositionStatus.CLOSED,
-                Position.realized_pnl_usd.is_not(None),
-                Position.closed_at < week_start,
-            )
-            pnl_before = sum(
-                (r for r in (await session.execute(pnl_before_stmt)).scalars().all() if r),
-                start=Decimal("0"),
-            )
-            capital_start = self.PAPER_INITIAL_CAPITAL_USD + pnl_before
+            # HARD RESET: capital de início é sempre $1000, independente
+            # do P&L cumulativo das semanas anteriores.
+            capital_start = self.PAPER_INITIAL_CAPITAL_USD
 
             # Posições fechadas DURANTE esta semana (antes do reset)
             pnl_week_stmt = select(Position.realized_pnl_usd).where(
@@ -343,12 +338,15 @@ class RebalancingScheduler:
                     await session.commit()
                 n_force_closed += 1
 
-        # Conta wins/losses das posições normalmente fechadas durante a semana
+        # Conta wins/losses das posições normalmente fechadas durante a semana.
+        # Excluímos por `notes != 'paper_reset'` em vez de `closed_at < now`
+        # — mais robusto a positions com timestamps "no futuro" (testes ou
+        # casos edge de clock skew).
         async with self._sessionmaker() as session:
             week_closed_stmt = select(Position).where(
                 Position.status == PositionStatus.CLOSED,
                 Position.closed_at >= week_start,
-                Position.closed_at < now,  # exclui as do reset
+                (Position.notes != "paper_reset") | Position.notes.is_(None),
                 Position.realized_pnl_usd.is_not(None),
             )
             week_closed = list(

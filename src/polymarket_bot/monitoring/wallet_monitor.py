@@ -409,11 +409,16 @@ class WalletMonitor:
         wallet_addr = first.wallet.address.lower()
         side: TradeSide = first.side
 
+        # SizeDecision tem `final_size_usd` (não `size_usd`) e EvResult tem
+        # `margin` (não `expected_value`). Bug anterior: ambos lançavam
+        # AttributeError, apanhado pelo except no caller → skips notificados
+        # no Telegram mas nunca persistidos em `bot_trades`. Conta de 0 skips
+        # na DB mesmo com Telegram cheio de "skip: ...".
         size_usd = (
-            result.size.size_usd if result.size is not None else Decimal("0")
+            result.size.final_size_usd if result.size is not None else Decimal("0")
         )
         expected_value = (
-            float(result.ev.expected_value) if result.ev is not None else 0.0
+            float(result.ev.margin) if result.ev is not None else 0.0
         )
         best_ask = market.orderbook.best_ask if market.orderbook else None
         intended_price = best_ask if best_ask is not None else Decimal("0")
